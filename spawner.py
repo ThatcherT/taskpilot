@@ -13,8 +13,23 @@ CLAUDE_JSON = Path.home() / ".claude.json"
 PLUGIN_ROOT = Path(__file__).parent
 CHANNEL_TEMPLATE = PLUGIN_ROOT / "channel_template.mjs"
 
-# Absolute node path — nvm isn't in MCP subprocess PATH
-NODE_BIN = shutil.which("node") or "/home/thatcher/.nvm/versions/node/v22.12.0/bin/node"
+# Absolute node path — nvm isn't in MCP subprocess PATH, and /usr/bin/node
+# is v12 which can't run ES modules with top-level await.
+# Must resolve to a node >= 18.
+_node = shutil.which("node")
+if _node and os.path.realpath(_node).startswith("/usr"):
+    # System node is too old, find nvm version
+    _node = None
+if not _node:
+    nvm_dir = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_dir.exists():
+        versions = sorted(nvm_dir.iterdir(), reverse=True)
+        for v in versions:
+            candidate = v / "bin" / "node"
+            if candidate.exists():
+                _node = str(candidate)
+                break
+NODE_BIN = _node or "/usr/bin/node"
 
 
 def slugify(name: str) -> str:
@@ -160,6 +175,10 @@ done"""
         except subprocess.TimeoutExpired:
             pass
         time.sleep(1)
+
+    # Unregister from .claude.json now that the task session owns the MCP process.
+    # This prevents other Claude sessions from stealing the channel.
+    unregister_channel_mcp(task_id)
 
     # Brief settle time for MCP connection
     time.sleep(3)
