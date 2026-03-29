@@ -17,6 +17,7 @@ def create_task(
     name: str,
     description: str,
     plugins: list[str] | None = None,
+    operating_brief: dict | None = None,
 ) -> dict:
     """Create a new autonomous task. Writes config files and allocates a channel port.
 
@@ -24,12 +25,28 @@ def create_task(
         name: Human-readable task name (e.g., "Sell my lawnmower").
         description: Full task description — what the agent should do.
         plugins: Optional list of plugin directory paths to load.
+        operating_brief: Optional dict with richer task definition. Keys:
+            objectives (list[str]): Measurable goals.
+            workflows (list[str]): Ordered phases/steps.
+            success_criteria (list[str]): How to know the task is done.
+            boundaries (list[str]): What NOT to do.
+            capabilities (list[str]): Required capabilities (e.g. ["memory", "scheduling"]).
+            schedule (str): Cron expression for recurring agents.
 
     Returns:
         Task record with task_id, port, and status.
     """
     task_id = spawner.slugify(name)
     plugins = plugins or []
+    operating_brief = operating_brief or {}
+
+    # Auto-resolve capability plugins via nov-hub
+    capabilities = operating_brief.get("capabilities", [])
+    if capabilities:
+        resolved = spawner.resolve_capabilities(capabilities)
+        for path in resolved:
+            if path not in plugins:
+                plugins.append(path)
 
     conn = store.get_db()
 
@@ -39,11 +56,11 @@ def create_task(
         conn.close()
         return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
 
-    task = store.create_task(conn, task_id, name, description, plugins)
+    task = store.create_task(conn, task_id, name, description, plugins, operating_brief)
     conn.close()
 
     # Write config files
-    spawner.write_task_config(task_id, name, description, plugins)
+    spawner.write_task_config(task_id, name, description, plugins, operating_brief)
 
     # Register channel MCP in .claude.json
     spawner.register_channel_mcp(task_id, task["port"])

@@ -29,12 +29,20 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             status TEXT DEFAULT 'pending',
             port INTEGER UNIQUE,
             plugins TEXT DEFAULT '[]',
+            operating_brief TEXT DEFAULT '{}',
             invocation_count INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         )
     """)
     conn.commit()
+
+    # Migrate existing DBs that lack the operating_brief column
+    try:
+        conn.execute("SELECT operating_brief FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN operating_brief TEXT DEFAULT '{}'")
+        conn.commit()
 
 
 def allocate_port(conn: sqlite3.Connection) -> int:
@@ -52,12 +60,14 @@ def create_task(
     name: str,
     description: str,
     plugins: list[str] | None = None,
+    operating_brief: dict | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins)
-           VALUES (?, ?, ?, ?, ?)""",
-        (task_id, name, description, port, json.dumps(plugins or [])),
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (task_id, name, description, port,
+         json.dumps(plugins or []), json.dumps(operating_brief or {})),
     )
     conn.commit()
     return get_task(conn, task_id)

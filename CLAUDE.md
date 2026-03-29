@@ -53,10 +53,27 @@ claude --plugin-dir /home/thatcher/projects/nov/projects/plugins/taskpilot
 
 ## MCP Tools
 
-- `create_task(name, description, plugins?)` — create task config + allocate port
+- `create_task(name, description, plugins?, operating_brief?)` — create task config + allocate port
 - `spawn_task(task_id)` — launch tmux session (~16s startup)
 - `list_tasks(status?)` — list all tasks with live health
 - `get_task(task_id)` — full detail + state.json
 - `send_message(task_id, message)` — POST to channel
 - `kill_task(task_id)` — kill tmux + clean up
 - `get_task_log(task_id, lines?)` — capture tmux pane output
+
+## Operating Brief
+
+The `operating_brief` parameter to `create_task` accepts a dict with:
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `objectives` | list[str] | Measurable goals |
+| `workflows` | list[str] | Ordered phases/steps |
+| `success_criteria` | list[str] | Completion conditions |
+| `boundaries` | list[str] | What NOT to do |
+| `capabilities` | list[str] | Required capabilities (auto-resolved via nov-hub) |
+| `schedule` | str | Cron expression for recurring agents |
+
+Capabilities declared in the brief are automatically resolved to provider plugins via nov-hub at task creation time. The agent's CLAUDE.md is dynamically generated with sections for each declared capability.
+
+Environment variable `TASKPILOT_TASK_ID` is exported in the tmux session so capability plugins can scope their storage per-task.

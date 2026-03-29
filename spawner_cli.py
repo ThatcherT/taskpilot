@@ -23,6 +23,7 @@ def main():
     parser.add_argument("description", help="Task description")
     parser.add_argument("--name", help="Explicit task name (default: derived from description)")
     parser.add_argument("--plugins", help="Comma-separated plugin directory paths", default="")
+    parser.add_argument("--brief", help="Path to JSON file with operating brief", default="")
     parser.add_argument("--dry-run", action="store_true", help="Create task without spawning")
     args = parser.parse_args()
 
@@ -30,6 +31,21 @@ def main():
         name = args.name or args.description[:80]
         task_id = spawner.slugify(name)
         plugins = [p.strip() for p in args.plugins.split(",") if p.strip()]
+
+        # Load operating brief from file if provided
+        operating_brief = {}
+        if args.brief:
+            brief_path = Path(args.brief)
+            if brief_path.exists():
+                operating_brief = json.loads(brief_path.read_text())
+
+        # Auto-resolve capability plugins via nov-hub
+        capabilities = operating_brief.get("capabilities", [])
+        if capabilities:
+            resolved = spawner.resolve_capabilities(capabilities)
+            for path in resolved:
+                if path not in plugins:
+                    plugins.append(path)
 
         conn = store.get_db()
 
@@ -44,11 +60,11 @@ def main():
             sys.exit(1)
 
         # Create task
-        task = store.create_task(conn, task_id, name, args.description, plugins)
+        task = store.create_task(conn, task_id, name, args.description, plugins, operating_brief)
         conn.close()
 
         # Write config files
-        spawner.write_task_config(task_id, name, args.description, plugins)
+        spawner.write_task_config(task_id, name, args.description, plugins, operating_brief)
 
         # Register channel MCP
         spawner.register_channel_mcp(task_id, task["port"])
