@@ -129,12 +129,42 @@ class TestWriteTaskConfig:
 
 
 class TestResolveCapabilities:
-    def test_empty_capabilities(self):
-        assert spawner.resolve_capabilities([]) == []
+    @pytest.fixture()
+    def fake_marketplace(self, tmp_path):
+        """Set up fake marketplace and installed_plugins files, return tmp_path."""
+        marketplace = tmp_path / "marketplace.json"
+        marketplace.write_text(json.dumps({"plugins": [
+            {"name": "memory-file", "provides": ["memory"],
+             "source": {"source": "github", "repo": "ThatcherT/memory-file"},
+             "version": "0.1.0"},
+        ]}))
+        installed = tmp_path / "installed.json"
+        installed.write_text(json.dumps({"version": 2, "plugins": {}}))
+        with patch.object(spawner, 'MARKETPLACE_PATH', marketplace), \
+             patch.object(spawner, 'INSTALLED_PLUGINS_PATH', installed), \
+             patch.object(spawner, 'PLUGIN_CACHE_DIR', tmp_path / "cache"):
+            yield tmp_path
 
-    def test_missing_nov_hub(self, tmp_path):
-        """Should return empty list if nov-dependency-resolver doesn't exist."""
-        with patch.object(spawner, 'PLUGIN_ROOT', tmp_path):
-            # tmp_path.parent / "nov-dependency-resolver" won't exist
+    def test_resolves_installed_provider(self, fake_marketplace):
+        """Returns installPath when provider is already installed."""
+        installed = fake_marketplace / "installed.json"
+        installed.write_text(json.dumps({"version": 2, "plugins": {
+            "memory-file@nov-plugins": [{"installPath": "/fake/memory-file", "version": "0.1.0"}],
+        }}))
+        assert spawner.resolve_capabilities(["memory"]) == ["/fake/memory-file"]
+
+    def test_clones_when_not_installed(self, fake_marketplace):
+        """Clones from GitHub when provider is not installed."""
+        with patch("spawner.subprocess.run") as mock_run:
+            mock_run.return_value = type("R", (), {"returncode": 0})()
             result = spawner.resolve_capabilities(["memory"])
-            assert result == []
+            args = mock_run.call_args[0][0]
+            assert args[:2] == ["git", "clone"]
+            assert "ThatcherT/memory-file" in args[4]
+            assert result == [str(fake_marketplace / "cache" / "memory-file" / "0.1.0")]
+
+    def test_clone_failure_skips(self, fake_marketplace):
+        """Skips capability gracefully when clone fails."""
+        with patch("spawner.subprocess.run") as mock_run:
+            mock_run.return_value = type("R", (), {"returncode": 1})()
+            assert spawner.resolve_capabilities(["memory"]) == []

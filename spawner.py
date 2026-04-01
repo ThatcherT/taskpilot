@@ -2,6 +2,7 @@
 
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -12,6 +13,12 @@ TASKPILOT_DIR = Path.home() / ".taskpilot"
 CLAUDE_JSON = Path.home() / ".claude.json"
 PLUGIN_ROOT = Path(__file__).parent
 CHANNEL_TEMPLATE = PLUGIN_ROOT / "channel_template.mjs"
+
+# Marketplace and plugin registry paths
+CLAUDE_DIR = Path.home() / ".claude"
+MARKETPLACE_PATH = CLAUDE_DIR / "plugins" / "marketplaces" / "nov-plugins" / ".claude-plugin" / "marketplace.json"
+INSTALLED_PLUGINS_PATH = CLAUDE_DIR / "plugins" / "installed_plugins.json"
+PLUGIN_CACHE_DIR = CLAUDE_DIR / "plugins" / "cache" / "nov-plugins"
 
 # Absolute node path — nvm isn't in MCP subprocess PATH, and /usr/bin/node
 # is v12 which can't run ES modules with top-level await.
@@ -177,45 +184,136 @@ If state.json exists, read it first to understand your previous progress, then c
     return "\n\n".join(sections) + "\n"
 
 
+def _read_json(path: Path) -> dict | None:
+    """Read a JSON file, return None if missing or invalid."""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _is_plugin_installed(name: str) -> bool:
+    """Check installed_plugins.json for a plugin by name."""
+    data = _read_json(INSTALLED_PLUGINS_PATH)
+    if not data:
+        return False
+    for key in data.get("plugins", {}):
+        if key.split("@")[0] == name:
+            return True
+    return False
+
+
+def _get_install_path(name: str) -> str | None:
+    """Get the installPath for an installed plugin, or None."""
+    data = _read_json(INSTALLED_PLUGINS_PATH)
+    if not data:
+        return None
+    for key, entries in data.get("plugins", {}).items():
+        if key.split("@")[0] == name and entries:
+            return entries[0].get("installPath")
+    return None
+
+
+def _check_environment(env_reqs: dict) -> bool:
+    """Check if all environment requirements are satisfied."""
+    for key, value in env_reqs.items():
+        values = value if isinstance(value, list) else [value]
+        if key == "os":
+            if not any(platform.system().lower() == v for v in values):
+                return False
+        elif key == "binary":
+            if not any(shutil.which(v) is not None for v in values):
+                return False
+        elif key == "plugin":
+            if not any(_is_plugin_installed(v) for v in values):
+                return False
+        elif key == "file":
+            if not any(Path(os.path.expanduser(v)).exists() for v in values):
+                return False
+    return True
+
+
+def _clone_plugin(name: str, repo: str, version: str = "latest") -> str | None:
+    """Clone a plugin from GitHub into the standard cache path. Returns path or None."""
+    target = PLUGIN_CACHE_DIR / name / version
+    if target.exists():
+        return str(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["git", "clone", "--depth", "1",
+         f"https://github.com/{repo}.git", str(target)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        if target.exists():
+            shutil.rmtree(target)
+        return None
+    return str(target)
+
+
 def resolve_capabilities(capabilities: list[str]) -> list[str]:
-    """Resolve capability names to installed plugin paths via nov-dependency-resolver.
+    """Resolve capability names to plugin directory paths.
+
+    For each capability:
+    1. Find providers in marketplace.json (plugins with capability in 'provides')
+    2. Filter by environment match (os, binary, etc.)
+    3. Prefer already-installed providers
+    4. If no installed provider matches, clone the best one from GitHub
+    5. Return plugin directory paths
 
     Returns:
-        List of plugin directory paths for providers that match the declared capabilities.
+        List of plugin directory paths.
     """
     if not capabilities:
         return []
 
-    # Import nov-dependency-resolver's resolver directly (same machine, avoid MCP overhead)
-    nov_hub_path = Path(__file__).parent.parent / "nov-dependency-resolver"
-    if not nov_hub_path.exists():
+    marketplace = _read_json(MARKETPLACE_PATH)
+    if not marketplace:
         return []
 
-    import sys
-    original_path = sys.path[:]
-    sys.path.insert(0, str(nov_hub_path))
-    try:
-        import resolver as hub_resolver
-        import registry as hub_registry
+    plugins = marketplace.get("plugins", [])
+    resolved_paths = []
 
-        resolved_plugins = []
-        for cap in capabilities:
-            providers = hub_resolver.resolve(cap)
-            for provider in providers:
-                if provider["match"] and provider["installed"]:
-                    # Look up install path
-                    installed = hub_registry.get_installed_plugins()
-                    for key, entries in installed.items():
-                        if key.split("@")[0] == provider["name"] and entries:
-                            install_path = entries[0].get("installPath", "")
-                            if install_path and install_path not in resolved_plugins:
-                                resolved_plugins.append(install_path)
-                    break  # Use first matched+installed provider
-        return resolved_plugins
-    except ImportError:
-        return []
-    finally:
-        sys.path[:] = original_path
+    for cap in capabilities:
+        providers = [p for p in plugins if cap in p.get("provides", [])]
+        if not providers:
+            continue
+
+        # Filter by environment match, track install status
+        candidates = []
+        for p in providers:
+            if not _check_environment(p.get("environment", {})):
+                continue
+            candidates.append({
+                "name": p["name"],
+                "source": p.get("source", {}),
+                "version": p.get("version", "latest"),
+                "installed_path": _get_install_path(p["name"]),
+            })
+
+        if not candidates:
+            continue
+
+        # Prefer installed providers
+        candidates.sort(key=lambda c: c["installed_path"] is None)
+        best = candidates[0]
+
+        if best["installed_path"]:
+            path = best["installed_path"]
+        else:
+            repo = best["source"].get("repo", "")
+            if not repo:
+                continue
+            path = _clone_plugin(best["name"], repo, best["version"])
+            if not path:
+                continue
+
+        if path not in resolved_paths:
+            resolved_paths.append(path)
+
+    return resolved_paths
 
 
 def register_channel_mcp(task_id: str, port: int) -> None:
