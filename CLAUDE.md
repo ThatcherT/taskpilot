@@ -48,7 +48,7 @@ make test                       # run tests
 
 Install as plugin:
 ```bash
-claude --plugin-dir /home/thatcher/projects/nov/projects/plugins/taskpilot
+claude --plugin-dir /home/thatcher/projects/nov/projects/plugins/providers/taskpilot
 ```
 
 ## MCP Tools
