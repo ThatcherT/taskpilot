@@ -28,11 +28,13 @@ Spawn a new autonomous agent session.
 
 3. **Determine plugins needed.** Based on the task, identify which plugins the spawned session needs access to. Capabilities are auto-resolved via nov-dependency-resolver — you only need to specify plugins that aren't covered by the capability system.
 
-4. **Create the task.** Call `create_task(name, description, plugins, operating_brief)` from the taskpilot MCP. The operating brief is a dict with keys: objectives, workflows, success_criteria, boundaries, capabilities, schedule.
+4. **Choose model (if requested).** If the user wants a specific model, pass it as the `model` parameter. Valid values: `"sonnet"`, `"opus"`, `"haiku"`, or a full model ID like `"claude-sonnet-4-6"`. If not specified, the agent uses the default model.
 
-5. **Spawn the task.** Call `spawn_task(task_id)`. This takes ~16 seconds to start up (trust dialog + channel initialization).
+5. **Create the task.** Call `create_task(name, description, plugins, operating_brief, model)` from the taskpilot MCP. The operating brief is a dict with keys: objectives, workflows, success_criteria, boundaries, capabilities, schedule.
 
-6. **Confirm.** Tell the user:
+6. **Spawn the task.** Call `spawn_task(task_id)`. This takes ~16 seconds to start up (trust dialog + channel initialization).
+
+7. **Confirm.** Tell the user:
    - The task is running
    - The tmux session name (they can `tmux attach -t <name>` to watch)
    - The channel port (they can `curl -s -d 'message' http://localhost:<port>` to send messages)

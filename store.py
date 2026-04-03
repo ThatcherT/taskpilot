@@ -31,6 +31,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             plugins TEXT DEFAULT '[]',
             operating_brief TEXT DEFAULT '{}',
             invocation_count INTEGER DEFAULT 0,
+            model TEXT DEFAULT NULL,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         )
@@ -42,6 +43,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("SELECT operating_brief FROM tasks LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE tasks ADD COLUMN operating_brief TEXT DEFAULT '{}'")
+        conn.commit()
+
+    # Migrate existing DBs that lack the model column
+    try:
+        conn.execute("SELECT model FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT DEFAULT NULL")
         conn.commit()
 
 
@@ -61,13 +69,14 @@ def create_task(
     description: str,
     plugins: list[str] | None = None,
     operating_brief: dict | None = None,
+    model: str | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
-         json.dumps(plugins or []), json.dumps(operating_brief or {})),
+         json.dumps(plugins or []), json.dumps(operating_brief or {}), model),
     )
     conn.commit()
     return get_task(conn, task_id)

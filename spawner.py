@@ -346,7 +346,7 @@ def tmux_session_name(task_id: str) -> str:
     return f"taskpilot-{task_id}"
 
 
-def spawn_tmux(task_id: str, port: int, plugins: list[str]) -> bool:
+def spawn_tmux(task_id: str, port: int, plugins: list[str], model: str | None = None) -> bool:
     """Launch the Claude session in tmux with channel."""
     session = tmux_session_name(task_id)
     server_name = f"task-{task_id}"
@@ -357,6 +357,9 @@ def spawn_tmux(task_id: str, port: int, plugins: list[str]) -> bool:
     for p in plugins:
         plugin_flags += f" --plugin-dir {p}"
 
+    # Build model flag
+    model_flag = f" --model {model}" if model else ""
+
     # The tmux command: while-loop for crash recovery
     # rotation.py handles respawn decisions
     # Export TASKPILOT_TASK_ID so capability plugins can scope their storage
@@ -365,7 +368,7 @@ while true; do
   cd {td} && \\
   claude --dangerously-skip-permissions \\
     --dangerously-load-development-channels server:{server_name} \\
-    {plugin_flags} \\
+    {plugin_flags}{model_flag} \\
     --name {task_id}
   python {PLUGIN_ROOT / 'rotation.py'} {task_id} || break
   sleep 5

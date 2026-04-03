@@ -18,6 +18,7 @@ def create_task(
     description: str,
     plugins: list[str] | None = None,
     operating_brief: dict | None = None,
+    model: str | None = None,
 ) -> dict:
     """Create a new autonomous task. Writes config files and allocates a channel port.
 
@@ -32,6 +33,7 @@ def create_task(
             boundaries (list[str]): What NOT to do.
             capabilities (list[str]): Required capabilities (e.g. ["memory", "scheduling"]).
             schedule (str): Cron expression for recurring agents.
+        model: Optional Claude model to use (e.g., "sonnet", "opus", "haiku").
 
     Returns:
         Task record with task_id, port, and status.
@@ -56,7 +58,7 @@ def create_task(
         conn.close()
         return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
 
-    task = store.create_task(conn, task_id, name, description, plugins, operating_brief)
+    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model)
     conn.close()
 
     # Write config files
@@ -89,9 +91,10 @@ def spawn_task(task_id: str) -> dict:
 
     plugins = json.loads(task["plugins"]) if task["plugins"] else []
     port = task["port"]
+    model = task.get("model")
 
     # Launch tmux session (blocks ~16s for startup dialogs)
-    success = spawner.spawn_tmux(task_id, port, plugins)
+    success = spawner.spawn_tmux(task_id, port, plugins, model=model)
     if not success:
         conn.close()
         return {"error": "Failed to launch tmux session"}

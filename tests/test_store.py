@@ -32,6 +32,11 @@ class TestSchema:
         columns = [row[1] for row in cursor.fetchall()]
         assert "operating_brief" in columns
 
+    def test_model_column_exists(self, db):
+        cursor = db.execute("PRAGMA table_info(tasks)")
+        columns = [row[1] for row in cursor.fetchall()]
+        assert "model" in columns
+
     def test_migration_adds_column_to_old_schema(self, tmp_path):
         """Simulate an old DB without operating_brief and verify migration."""
         db_path = str(tmp_path / "old.db")
@@ -87,6 +92,14 @@ class TestCreateTask:
         task = store.create_task(db, "t3", "T3", "desc")
         stored_brief = json.loads(task["operating_brief"])
         assert stored_brief == {}
+
+    def test_create_with_model(self, db):
+        task = store.create_task(db, "t4", "T4", "desc", model="sonnet")
+        assert task["model"] == "sonnet"
+
+    def test_create_without_model_defaults_null(self, db):
+        task = store.create_task(db, "t5", "T5", "desc")
+        assert task["model"] is None
 
     def test_port_allocation_sequential(self, db):
         t1 = store.create_task(db, "a", "A", "desc")
