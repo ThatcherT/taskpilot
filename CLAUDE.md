@@ -53,7 +53,7 @@ claude --plugin-dir /home/thatcher/projects/nov/projects/plugins/providers/taskp
 
 ## MCP Tools
 
-- `create_task(name, description, plugins?, operating_brief?)` — create task config + allocate port
+- `create_task(name, description, plugins?, operating_brief?, model?)` — create task config + allocate port
 - `spawn_task(task_id)` — launch tmux session (~16s startup)
 - `list_tasks(status?)` — list all tasks with live health
 - `get_task(task_id)` — full detail + state.json
