@@ -149,7 +149,7 @@ class TestResolveCapabilities:
         """Returns installPath when provider is already installed."""
         installed = fake_marketplace / "installed.json"
         installed.write_text(json.dumps({"version": 2, "plugins": {
-            "memory-file@nov-plugins": [{"installPath": "/fake/memory-file", "version": "0.1.0"}],
+            "memory-file@softwaresoftware-plugins": [{"installPath": "/fake/memory-file", "version": "0.1.0"}],
         }}))
         assert spawner.resolve_capabilities(["memory"]) == ["/fake/memory-file"]
 

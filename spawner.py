@@ -16,9 +16,9 @@ CHANNEL_TEMPLATE = PLUGIN_ROOT / "channel_template.mjs"
 
 # Marketplace and plugin registry paths
 CLAUDE_DIR = Path.home() / ".claude"
-MARKETPLACE_PATH = CLAUDE_DIR / "plugins" / "marketplaces" / "nov-plugins" / ".claude-plugin" / "marketplace.json"
+MARKETPLACE_PATH = CLAUDE_DIR / "plugins" / "marketplaces" / "softwaresoftware-plugins" / ".claude-plugin" / "marketplace.json"
 INSTALLED_PLUGINS_PATH = CLAUDE_DIR / "plugins" / "installed_plugins.json"
-PLUGIN_CACHE_DIR = CLAUDE_DIR / "plugins" / "cache" / "nov-plugins"
+PLUGIN_CACHE_DIR = CLAUDE_DIR / "plugins" / "cache" / "softwaresoftware-plugins"
 
 # Absolute node path — nvm isn't in MCP subprocess PATH, and /usr/bin/node
 # is v12 which can't run ES modules with top-level await.
