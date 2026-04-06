@@ -195,7 +195,6 @@ class TestMemoryCapability:
         memory_server.store_memory(
             "niche-1-pricing",
             "Dog anxiety products: avg $25-45, margins 60-70% on supplements",
-            hints={"source": "gummymine", "confidence": "high"},
         )
         result = memory_server.recall_memory("niche-1-pricing")
         assert result["found"] is True
@@ -223,7 +222,7 @@ class TestMemoryCapability:
         memory_server.store_memory(
             "market-trend",
             "Pet industry growing 8% YoY",
-            hints={"shared": True},
+            shared=True,
         )
         shared_dir = integrated_env["tmp_path"] / "shared-memory"
         assert (shared_dir / "market-trend.json").exists()
@@ -272,7 +271,7 @@ class TestApprovalCapability:
         req = approval_server.request_approval(
             "Post to r/dogs: '5 Signs Your Dog Has Anxiety (And What Actually Works)'",
             context="Content calendar Week 2, niche: dog anxiety products",
-            hints={"category": "social-post", "urgency": "normal"},
+            category="social-post",
         )
         assert req["status"] == "pending"
 
@@ -291,7 +290,8 @@ class TestApprovalCapability:
         req = approval_server.request_approval(
             "Purchase $200 Reddit ads for r/dogs targeting 'dog anxiety'",
             context="Marketing budget experiment",
-            hints={"category": "purchase", "reversible": False},
+            category="purchase",
+            reversible=False,
         )
 
         approval_server.record_approval_response(
@@ -346,7 +346,7 @@ class TestFullAgentLifecycle:
         post_req = approval_server.request_approval(
             "Post to r/dogs: 'I spent a month researching dog anxiety solutions...'",
             context="First content piece, soft launch for dog-anxiety niche",
-            hints={"category": "social-post"},
+            category="social-post",
         )
         assert post_req["status"] == "pending"
 
@@ -361,7 +361,6 @@ class TestFullAgentLifecycle:
         memory_server.store_memory(
             "post-1-result",
             "r/dogs post published. 47 upvotes in first 2 hours, 12 comments.",
-            hints={"source": "content-tracking"},
         )
 
         # 6. Verify accumulated knowledge
@@ -374,7 +373,7 @@ class TestFullAgentLifecycle:
         # 7. Agent wants to spend money — human rejects
         ad_req = approval_server.request_approval(
             "Boost r/dogs post with $50 Reddit promotion",
-            hints={"category": "purchase"},
+            category="purchase",
         )
         approval_server.record_approval_response(
             ad_req["request_id"],
