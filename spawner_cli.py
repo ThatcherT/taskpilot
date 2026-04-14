@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--name", help="Explicit task name (default: derived from description)")
     parser.add_argument("--plugins", help="Comma-separated plugin directory paths", default="")
     parser.add_argument("--brief", help="Path to JSON file with operating brief", default="")
+    parser.add_argument("--cwd", help="Working directory for the task", default="")
+    parser.add_argument("--channels", help="Comma-separated additional dev channel servers", default="")
     parser.add_argument("--dry-run", action="store_true", help="Create task without spawning")
     args = parser.parse_args()
 
@@ -59,8 +61,13 @@ def main():
             }))
             sys.exit(1)
 
+        # Parse optional params
+        cwd = args.cwd or None
+        channels = [c.strip() for c in args.channels.split(",") if c.strip()]
+
         # Create task
-        task = store.create_task(conn, task_id, name, args.description, plugins, operating_brief)
+        task = store.create_task(conn, task_id, name, args.description, plugins, operating_brief,
+                                 cwd=cwd, channels=channels)
         conn.close()
 
         # Write config files
@@ -79,7 +86,7 @@ def main():
             return
 
         # Spawn tmux session (~16s for startup dialogs)
-        success = spawner.spawn_tmux(task_id, task["port"], plugins)
+        success = spawner.spawn_tmux(task_id, task["port"], plugins, cwd=cwd, channels=channels)
         if not success:
             spawner.unregister_channel_mcp(task_id)
             print(json.dumps({"ok": False, "error": "Failed to launch tmux session"}))

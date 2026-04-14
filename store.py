@@ -52,6 +52,20 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT DEFAULT NULL")
         conn.commit()
 
+    # Migrate: cwd column (custom working directory)
+    try:
+        conn.execute("SELECT cwd FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN cwd TEXT DEFAULT NULL")
+        conn.commit()
+
+    # Migrate: channels column (additional dev channel servers)
+    try:
+        conn.execute("SELECT channels FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN channels TEXT DEFAULT '[]'")
+        conn.commit()
+
 
 def allocate_port(conn: sqlite3.Connection) -> int:
     """Find the next available port starting from PORT_RANGE_START."""
@@ -70,13 +84,16 @@ def create_task(
     plugins: list[str] | None = None,
     operating_brief: dict | None = None,
     model: str | None = None,
+    cwd: str | None = None,
+    channels: list[str] | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
-         json.dumps(plugins or []), json.dumps(operating_brief or {}), model),
+         json.dumps(plugins or []), json.dumps(operating_brief or {}), model,
+         cwd, json.dumps(channels or [])),
     )
     conn.commit()
     return get_task(conn, task_id)

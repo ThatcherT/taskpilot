@@ -19,6 +19,8 @@ def create_task(
     plugins: list[str] | None = None,
     operating_brief: dict | None = None,
     model: str | None = None,
+    cwd: str | None = None,
+    channels: list[str] | None = None,
 ) -> dict:
     """Create a new autonomous task. Writes config files and allocates a channel port.
 
@@ -34,6 +36,8 @@ def create_task(
             capabilities (list[str]): Required capabilities (e.g. ["memory", "scheduling"]).
             schedule (str): Cron expression for recurring agents.
         model: Optional Claude model to use (e.g., "sonnet", "opus", "haiku").
+        cwd: Optional working directory for the task (default: ~/.taskpilot/<task_id>/).
+        channels: Optional additional dev channel servers (e.g. ["server:session-proxy"]).
 
     Returns:
         Task record with task_id, port, and status.
@@ -41,6 +45,7 @@ def create_task(
     task_id = spawner.slugify(name)
     plugins = plugins or []
     operating_brief = operating_brief or {}
+    channels = channels or []
 
     # Auto-resolve capability plugins via nov-dependency-resolver
     capabilities = operating_brief.get("capabilities", [])
@@ -58,7 +63,7 @@ def create_task(
         conn.close()
         return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
 
-    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model)
+    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels)
     conn.close()
 
     # Write config files
@@ -92,9 +97,11 @@ def spawn_task(task_id: str) -> dict:
     plugins = json.loads(task["plugins"]) if task["plugins"] else []
     port = task["port"]
     model = task.get("model")
+    cwd = task.get("cwd")
+    channels = json.loads(task["channels"]) if task.get("channels") else []
 
     # Launch tmux session (blocks ~16s for startup dialogs)
-    success = spawner.spawn_tmux(task_id, port, plugins, model=model)
+    success = spawner.spawn_tmux(task_id, port, plugins, model=model, cwd=cwd, channels=channels)
     if not success:
         conn.close()
         return {"error": "Failed to launch tmux session"}
