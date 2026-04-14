@@ -19,12 +19,23 @@ Spawn and manage long-running autonomous Claude Code sessions. Each task runs in
 ## How It Works
 
 1. `create_task()` writes config to `~/.taskpilot/<id>/`, allocates a port, registers channel MCP in `~/.claude.json`
-2. `spawn_task()` launches a tmux session running Claude with the channel loaded
+2. `spawn_task()` launches the agent:
+   - **`kind=task`** (default): launches directly in tmux
+   - **`kind=service`**: generates `start.sh` + systemd user service, survives reboots
 3. The initial task prompt is POSTed to the channel after startup
 4. The agent works autonomously, writing state.json after each major action
 5. Messages flow via HTTP POST to the channel port; replies come back on SSE `/events`
 6. On crash, the while-loop in tmux respawns via `rotation.py`
 7. Task completes when the agent writes `"phase": "done"` to state.json
+
+## Service Persistence
+
+Agents created with `kind="service"` get a systemd user service (`taskpilot-<id>.service`) that auto-starts on boot. The pattern matches beats-dj: systemd runs a startup script that launches tmux + Claude, with a `while tmux has-session` tail loop for lifecycle tracking.
+
+- Start script: `~/.taskpilot/<id>/start.sh`
+- Systemd unit: `~/.config/systemd/user/taskpilot-<id>.service`
+- Check status: `systemctl --user status taskpilot-<id>`
+- `kill_task()` stops and disables the systemd service
 
 ## Architecture
 
@@ -53,7 +64,7 @@ claude --plugin-dir /home/thatcher/projects/softwaresoftware/projects/plugins/pr
 
 ## MCP Tools
 
-- `create_task(name, description, plugins?, operating_brief?, model?)` — create task config + allocate port
+- `create_task(name, description, plugins?, operating_brief?, model?, kind?)` — create task config + allocate port. kind="service" for reboot-persistent agents
 - `spawn_task(task_id)` — launch tmux session (~16s startup)
 - `list_tasks(status?)` — list all tasks with live health
 - `get_task(task_id)` — full detail + state.json
