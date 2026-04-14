@@ -325,5 +325,76 @@ def get_task_log(task_id: str, lines: int = 50) -> dict:
         return {"error": "Timeout capturing pane"}
 
 
+@mcp.tool()
+def destroy_task(task_id: str) -> dict:
+    """Permanently delete a killed/completed task — removes DB row and config directory.
+
+    Only works on tasks with status 'killed' or 'completed'. Use kill_task first
+    to stop a running task.
+
+    Args:
+        task_id: The task ID to destroy.
+
+    Returns:
+        Result of the destroy attempt.
+    """
+    conn = store.get_db()
+    task = store.get_task(conn, task_id)
+    if not task:
+        conn.close()
+        return {"error": f"Task '{task_id}' not found"}
+    if task["status"] in ("running", "pending"):
+        conn.close()
+        return {"error": f"Task '{task_id}' is {task['status']} — kill it first"}
+
+    # Remove config directory
+    import shutil
+    td = spawner.task_dir(task_id)
+    config_removed = False
+    if td.exists():
+        shutil.rmtree(td)
+        config_removed = True
+
+    # Remove DB row
+    store.delete_task(conn, task_id)
+    conn.close()
+
+    return {
+        "task_id": task_id,
+        "destroyed": True,
+        "config_removed": config_removed,
+    }
+
+
+@mcp.tool()
+def respawn_task(task_id: str) -> dict:
+    """Respawn a killed task — resets status to pending and launches it again.
+
+    Re-uses the original task config (description, plugins, model, kind).
+    Increments invocation_count.
+
+    Args:
+        task_id: The task ID to respawn.
+
+    Returns:
+        Result of the respawn attempt (same as spawn_task).
+    """
+    conn = store.get_db()
+    task = store.get_task(conn, task_id)
+    if not task:
+        conn.close()
+        return {"error": f"Task '{task_id}' not found"}
+    if task["status"] == "running":
+        conn.close()
+        return {"error": f"Task '{task_id}' is already running"}
+
+    # Reset status to pending so spawn_task accepts it
+    store.update_status(conn, task_id, "pending")
+    conn.close()
+
+    # Delegate to spawn_task
+    return spawn_task(task_id)
+
+
 if __name__ == "__main__":
     mcp.run()

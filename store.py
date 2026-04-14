@@ -143,3 +143,10 @@ def increment_invocation(conn: sqlite3.Connection, task_id: str) -> None:
         (task_id,),
     )
     conn.commit()
+
+
+def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Delete a task from the database. Returns True if a row was deleted."""
+    cursor = conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+    conn.commit()
+    return cursor.rowcount > 0
