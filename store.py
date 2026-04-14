@@ -66,6 +66,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN channels TEXT DEFAULT '[]'")
         conn.commit()
 
+    # Migrate: kind column (task or service)
+    try:
+        conn.execute("SELECT kind FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN kind TEXT DEFAULT 'task'")
+        conn.commit()
+
 
 def allocate_port(conn: sqlite3.Connection) -> int:
     """Find the next available port starting from PORT_RANGE_START."""
@@ -86,14 +93,15 @@ def create_task(
     model: str | None = None,
     cwd: str | None = None,
     channels: list[str] | None = None,
+    kind: str = "task",
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
          json.dumps(plugins or []), json.dumps(operating_brief or {}), model,
-         cwd, json.dumps(channels or [])),
+         cwd, json.dumps(channels or []), kind),
     )
     conn.commit()
     return get_task(conn, task_id)
