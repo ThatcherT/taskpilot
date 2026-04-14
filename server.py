@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -21,6 +22,7 @@ def create_task(
     model: str | None = None,
     cwd: str | None = None,
     channels: list[str] | None = None,
+    kind: str = "task",
 ) -> dict:
     """Create a new autonomous task. Writes config files and allocates a channel port.
 
@@ -38,10 +40,14 @@ def create_task(
         model: Optional Claude model to use (e.g., "sonnet", "opus", "haiku").
         cwd: Optional working directory for the task (default: ~/.taskpilot/<task_id>/).
         channels: Optional additional dev channel servers (e.g. ["server:session-proxy"]).
+        kind: "task" for one-shot jobs, "service" for always-on agents that survive reboots.
 
     Returns:
         Task record with task_id, port, and status.
     """
+    if kind not in ("task", "service"):
+        return {"error": f"Invalid kind '{kind}'. Must be 'task' or 'service'."}
+
     task_id = spawner.slugify(name)
     plugins = plugins or []
     operating_brief = operating_brief or {}
@@ -63,14 +69,15 @@ def create_task(
         conn.close()
         return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
 
-    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels)
+    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels, kind=kind)
     conn.close()
 
     # Write config files
     spawner.write_task_config(task_id, name, description, plugins, operating_brief)
 
-    # Register channel MCP in .claude.json
-    spawner.register_channel_mcp(task_id, task["port"])
+    # Register channel MCP in .claude.json (for kind=task; services handle this in start.sh)
+    if kind == "task":
+        spawner.register_channel_mcp(task_id, task["port"])
 
     return task
 
@@ -78,6 +85,9 @@ def create_task(
 @mcp.tool()
 def spawn_task(task_id: str) -> dict:
     """Launch a created task in a tmux session with its channel.
+
+    For kind=service, installs a systemd user service that survives reboots.
+    For kind=task (default), launches directly in tmux.
 
     Args:
         task_id: The task ID returned by create_task.
@@ -99,28 +109,57 @@ def spawn_task(task_id: str) -> dict:
     model = task.get("model")
     cwd = task.get("cwd")
     channels = json.loads(task["channels"]) if task.get("channels") else []
+    kind = task.get("kind", "task")
 
-    # Launch tmux session (blocks ~16s for startup dialogs)
-    success = spawner.spawn_tmux(task_id, port, plugins, model=model, cwd=cwd, channels=channels)
-    if not success:
+    if kind == "service":
+        # Generate startup script and install systemd service
+        spawner.write_service_script(task_id, port, plugins, model=model, cwd=cwd, channels=channels)
+        spawner.install_service(task_id)
+
+        # Poll for channel health (systemd starts the script which starts tmux)
+        for _ in range(40):
+            if spawner.channel_healthy(port):
+                break
+            time.sleep(1)
+
+        # Update status
+        store.update_status(conn, task_id, "running")
+        store.increment_invocation(conn, task_id)
         conn.close()
-        return {"error": "Failed to launch tmux session"}
 
-    # Update status
-    store.update_status(conn, task_id, "running")
-    store.increment_invocation(conn, task_id)
-    conn.close()
+        return {
+            "status": "running",
+            "task_id": task_id,
+            "port": port,
+            "kind": "service",
+            "tmux_session": spawner.tmux_session_name(task_id),
+            "systemd_service": spawner._systemd_unit_name(task_id),
+            "systemd_active": spawner.is_service_active(task_id),
+            "channel_healthy": spawner.channel_healthy(port),
+        }
+    else:
+        # Standard task — launch directly in tmux
+        success = spawner.spawn_tmux(task_id, port, plugins, model=model, cwd=cwd, channels=channels)
+        if not success:
+            conn.close()
+            return {"error": "Failed to launch tmux session"}
 
-    # Send initial task prompt
-    spawner.send_initial_prompt(port, task["description"])
+        # Update status
+        store.update_status(conn, task_id, "running")
+        store.increment_invocation(conn, task_id)
+        conn.close()
 
-    return {
-        "status": "running",
-        "task_id": task_id,
-        "port": port,
-        "tmux_session": spawner.tmux_session_name(task_id),
-        "channel_healthy": spawner.channel_healthy(port),
-    }
+        # Send initial task prompt
+        spawner.send_initial_prompt(port, task["description"])
+
+        return {
+            "status": "running",
+            "task_id": task_id,
+            "port": port,
+            "kind": "task",
+            "tmux_session": spawner.tmux_session_name(task_id),
+            "channel_healthy": spawner.channel_healthy(port),
+        }
 
 
 @mcp.tool()
@@ -141,6 +180,8 @@ def list_tasks(status: str | None = None) -> list[dict]:
     for t in tasks:
         t["tmux_alive"] = spawner.is_tmux_alive(t["task_id"])
         t["channel_healthy"] = spawner.channel_healthy(t["port"])
+        if t.get("kind") == "service":
+            t["systemd_active"] = spawner.is_service_active(t["task_id"])
     return tasks
 
 
@@ -162,6 +203,8 @@ def get_task(task_id: str) -> dict:
 
     task["tmux_alive"] = spawner.is_tmux_alive(task_id)
     task["channel_healthy"] = spawner.channel_healthy(task["port"])
+    if task.get("kind") == "service":
+        task["systemd_active"] = spawner.is_service_active(task_id)
 
     # Read state.json if it exists
     state_file = spawner.task_dir(task_id) / "state.json"
@@ -213,6 +256,8 @@ def send_message(task_id: str, message: str) -> dict:
 def kill_task(task_id: str) -> dict:
     """Kill a running task — stops tmux session and cleans up channel MCP.
 
+    For kind=service, also stops and disables the systemd user service.
+
     Args:
         task_id: The task ID.
 
@@ -225,7 +270,14 @@ def kill_task(task_id: str) -> dict:
         conn.close()
         return {"error": f"Task '{task_id}' not found"}
 
-    # Kill tmux
+    kind = task.get("kind", "task")
+    service_removed = False
+
+    # For services, stop and disable the systemd unit
+    if kind == "service":
+        service_removed = spawner.uninstall_service(task_id)
+
+    # Kill tmux (safety net for services, primary for tasks)
     tmux_killed = spawner.kill_tmux(task_id)
 
     # Unregister channel MCP
@@ -235,11 +287,15 @@ def kill_task(task_id: str) -> dict:
     store.update_status(conn, task_id, "killed")
     conn.close()
 
-    return {
+    result = {
         "task_id": task_id,
         "status": "killed",
         "tmux_killed": tmux_killed,
     }
+    if kind == "service":
+        result["service_removed"] = service_removed
+
+    return result
 
 
 @mcp.tool()
