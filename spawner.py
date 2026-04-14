@@ -562,12 +562,25 @@ d['mcpServers']['{server_name}'] = {{
 }}
 
 # Register project-scoped MCPs from cwd/.claude/settings.json
+# Resolve node/npx commands to absolute paths since Claude MCP spawner
+# doesn't inherit the shell PATH (nvm etc won't be available)
+import shutil
+_node_cmds = {{'node', 'npx', 'tsx'}}
+def _resolve_cmd(cmd):
+    if cmd in _node_cmds:
+        resolved = shutil.which(cmd)
+        if resolved:
+            return resolved
+    return cmd
+
 project_settings = Path('{project_dir}') / '.claude' / 'settings.json'
 _taskpilot_project_mcps = []
 if project_settings.exists():
     try:
         ps = json.loads(project_settings.read_text())
         for name, cfg in ps.get('mcpServers', {{}}).items():
+            cfg = dict(cfg)
+            cfg['command'] = _resolve_cmd(cfg.get('command', ''))
             d['mcpServers'][name] = cfg
             _taskpilot_project_mcps.append(name)
     except Exception:
