@@ -338,10 +338,21 @@ def register_channel_mcp(task_id: str, port: int) -> None:
 
 
 def unregister_channel_mcp(task_id: str) -> None:
-    """Remove the task's channel MCP server from ~/.claude.json."""
+    """Remove the task's channel MCP server and project MCPs from ~/.claude.json."""
     server_name = f"task-{task_id}"
     data = json.loads(CLAUDE_JSON.read_text())
-    data.get("mcpServers", {}).pop(server_name, None)
+    mcps = data.get("mcpServers", {})
+    mcps.pop(server_name, None)
+
+    # Also clean up project-scoped MCPs
+    pmcps_file = task_dir(task_id) / "project_mcps.json"
+    if pmcps_file.exists():
+        try:
+            for name in json.loads(pmcps_file.read_text()):
+                mcps.pop(name, None)
+        except Exception:
+            pass
+
     CLAUDE_JSON.write_text(json.dumps(data, indent=2))
 
 
@@ -533,6 +544,9 @@ def write_service_script(
 set -euo pipefail
 
 # Source user env for API keys, nvm, PATH
+# bashrc exits early for non-interactive shells, so source nvm directly
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && source "$NVM_DIR/nvm.sh"
 source "$HOME/.bashrc" 2>/dev/null || true
 
 SESSION="{session}"
@@ -620,7 +634,8 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# Unregister channel MCP + project MCPs — the task session now owns them
+# Unregister taskpilot channel MCP — the task session now owns it
+# Project MCPs stay in ~/.claude.json so they persist across context rotations
 python3 -c "
 import json
 from pathlib import Path
@@ -628,16 +643,7 @@ from pathlib import Path
 p = Path.home() / '.claude.json'
 d = json.loads(p.read_text())
 mcps = d.get('mcpServers', {{}})
-# Remove taskpilot channel
 mcps.pop('{server_name}', None)
-# Remove project-scoped MCPs
-pmcps_file = Path.home() / '.taskpilot' / '{task_id}' / 'project_mcps.json'
-if pmcps_file.exists():
-    try:
-        for name in json.loads(pmcps_file.read_text()):
-            mcps.pop(name, None)
-    except Exception:
-        pass
 p.write_text(json.dumps(d, indent=2))
 "
 
