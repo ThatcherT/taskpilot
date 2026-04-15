@@ -168,9 +168,8 @@ action (posting publicly, spending money, sending external communications), use
 Check approval status with `check_approval(request_id)`. If approval times out,
 skip the action and log it to state.json.""")
 
-    # Scheduling instructions (if capability declared)
-    if "scheduling" in capabilities:
-        sections.append("""## Scheduling
+    # Scheduling instructions (always available — built into taskpilot)
+    sections.append("""## Scheduling
 You have scheduling tools available. Use them to set up recurring workflows that
 should run on a cadence — daily research, periodic checks, content schedules.
 

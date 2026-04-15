@@ -1,8 +1,10 @@
-"""MCP server for taskpilot — task lifecycle and messaging."""
+"""MCP server for taskpilot — task lifecycle, messaging, and scheduling."""
 
 import json
+import os
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -11,6 +13,9 @@ import store
 import spawner
 
 mcp = FastMCP("taskpilot")
+
+TASKPILOT_DIR = Path.home() / ".taskpilot"
+SCHEDULES_FILE = TASKPILOT_DIR / "schedules.json"
 
 
 @mcp.tool()
@@ -394,6 +399,211 @@ def respawn_task(task_id: str) -> dict:
 
     # Delegate to spawn_task
     return spawn_task(task_id)
+
+
+# ---------------------------------------------------------------------------
+# Scheduling — cron-based recurring task events (merged from scheduler-cron)
+# ---------------------------------------------------------------------------
+
+
+def _read_schedules() -> dict:
+    if not SCHEDULES_FILE.exists():
+        return {}
+    try:
+        return json.loads(SCHEDULES_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_schedules(schedules: dict) -> None:
+    SCHEDULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULES_FILE.write_text(json.dumps(schedules, indent=2))
+
+
+def _get_current_crontab() -> str:
+    try:
+        result = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout if result.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def _set_crontab(content: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["crontab", "-"], input=content, capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def _schedule_tag(task_id: str, name: str) -> str:
+    return f"# taskpilot-schedule:{task_id}:{name}"
+
+
+def _human_to_cron(interval: str) -> str | None:
+    """Convert human-readable intervals to cron expressions.
+
+    Supports cron expressions (5 fields), "every Xm/Xh/Xd", "daily", "hourly", "weekly".
+    """
+    interval = interval.strip()
+    parts = interval.split()
+    if len(parts) == 5:
+        return interval
+
+    lower = interval.lower()
+    if lower == "daily":
+        return "0 9 * * *"
+    if lower == "hourly":
+        return "0 * * * *"
+    if lower == "weekly":
+        return "0 9 * * 1"
+
+    if lower.startswith("every "):
+        spec = lower[6:].strip()
+        if spec.endswith("m"):
+            try:
+                return f"*/{int(spec[:-1])} * * * *"
+            except ValueError:
+                pass
+        elif spec.endswith("h"):
+            try:
+                return f"0 */{int(spec[:-1])} * * *"
+            except ValueError:
+                pass
+        elif spec.endswith("d"):
+            try:
+                return f"0 9 */{int(spec[:-1])} * *"
+            except ValueError:
+                pass
+    return None
+
+
+def _get_task_port(task_id: str) -> int | None:
+    """Look up the channel port for a task from taskpilot.db."""
+    conn = store.get_db()
+    task = store.get_task(conn, task_id)
+    conn.close()
+    return task["port"] if task else None
+
+
+@mcp.tool()
+def schedule_task(
+    name: str,
+    plugin: str,
+    skill: str,
+    interval: str,
+    enabled: bool = True,
+) -> dict:
+    """Schedule a recurring task event via crontab.
+
+    Creates a crontab entry that posts a message to the agent's channel port
+    on the specified interval. The agent receives the message and decides what to do.
+
+    Args:
+        name: Unique name for this schedule (e.g., "daily-research", "price-check").
+        plugin: Plugin name for context (included in the message).
+        skill: Skill or workflow to trigger (included in the message).
+        interval: Cron expression (5 fields) or human-readable ("every 30m", "daily", "hourly").
+        enabled: Whether the schedule is active (default True).
+
+    Returns:
+        Confirmation with schedule details.
+    """
+    cron_expr = _human_to_cron(interval)
+    if not cron_expr:
+        return {"error": f"Invalid interval: '{interval}'. Use cron (5 fields), 'every Xm/Xh/Xd', 'daily', 'hourly', or 'weekly'."}
+
+    task_id = os.environ.get("TASKPILOT_TASK_ID", "unknown")
+    port = _get_task_port(task_id)
+    if not port:
+        return {"error": "Cannot determine channel port. Is TASKPILOT_TASK_ID set?"}
+
+    tag = _schedule_tag(task_id, name)
+    message = f"[scheduled:{name}] Time to run {skill} (plugin: {plugin})"
+    cron_line = f'{cron_expr} curl -s -d "{message}" http://localhost:{port} > /dev/null 2>&1 {tag}'
+
+    # Update crontab
+    current = _get_current_crontab()
+    lines = [l for l in current.splitlines() if tag not in l]
+    if enabled:
+        lines.append(cron_line)
+    new_crontab = "\n".join(lines)
+    if new_crontab and not new_crontab.endswith("\n"):
+        new_crontab += "\n"
+    if not _set_crontab(new_crontab):
+        return {"error": "Failed to update crontab"}
+
+    # Update schedules registry
+    schedules = _read_schedules()
+    schedules[f"{task_id}:{name}"] = {
+        "name": name,
+        "task_id": task_id,
+        "plugin": plugin,
+        "skill": skill,
+        "interval": interval,
+        "cron_expr": cron_expr,
+        "port": port,
+        "enabled": enabled,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_schedules(schedules)
+
+    return {
+        "scheduled": True,
+        "name": name,
+        "cron_expr": cron_expr,
+        "port": port,
+        "message": message,
+        "enabled": enabled,
+    }
+
+
+@mcp.tool()
+def list_scheduled_tasks() -> dict:
+    """List all scheduled tasks for the current agent.
+
+    Returns:
+        List of active schedules with their details.
+    """
+    task_id = os.environ.get("TASKPILOT_TASK_ID", "unknown")
+    schedules = _read_schedules()
+    task_schedules = [s for s in schedules.values() if s.get("task_id") == task_id]
+    return {"task_id": task_id, "count": len(task_schedules), "schedules": task_schedules}
+
+
+@mcp.tool()
+def remove_scheduled_task(name: str) -> dict:
+    """Remove a scheduled task.
+
+    Args:
+        name: The schedule name to remove.
+
+    Returns:
+        Confirmation of removal.
+    """
+    task_id = os.environ.get("TASKPILOT_TASK_ID", "unknown")
+    tag = _schedule_tag(task_id, name)
+
+    # Remove from crontab
+    current = _get_current_crontab()
+    lines = [l for l in current.splitlines() if tag not in l]
+    new_crontab = "\n".join(lines)
+    if new_crontab and not new_crontab.endswith("\n"):
+        new_crontab += "\n"
+    _set_crontab(new_crontab)
+
+    # Remove from schedules registry
+    schedules = _read_schedules()
+    key = f"{task_id}:{name}"
+    removed = key in schedules
+    schedules.pop(key, None)
+    _write_schedules(schedules)
+
+    return {"removed": removed, "name": name, "task_id": task_id}
 
 
 if __name__ == "__main__":

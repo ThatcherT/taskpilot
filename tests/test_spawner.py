@@ -74,9 +74,8 @@ class TestBuildClaudeMd:
         assert "request_approval" in md
 
     def test_memory_only_when_declared(self):
-        md = spawner._build_claude_md("Test", "desc", {"capabilities": ["scheduling"]})
+        md = spawner._build_claude_md("Test", "desc", {"capabilities": []})
         assert "## Memory" not in md
-        assert "## Scheduling" in md
 
     def test_always_has_core_sections(self):
         md = spawner._build_claude_md("Test", "desc", {})
@@ -84,6 +83,7 @@ class TestBuildClaudeMd:
         assert "## How to Escalate to Human" in md
         assert "## State File" in md
         assert "## Channel Communication" in md
+        assert "## Scheduling" in md  # built-in, always present
         assert "## On Startup" in md
 
 

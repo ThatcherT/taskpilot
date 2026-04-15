@@ -25,7 +25,6 @@ import server as taskpilot_server
 
 # Import capability plugin servers (need separate namespace)
 memory_file_path = PLUGINS_DIR / "memory-file"
-scheduler_cron_path = PLUGINS_DIR / "scheduler-cron"
 approval_channel_path = PLUGINS_DIR / "approval-channel"
 
 # Save references before imports that might conflict
@@ -44,8 +43,9 @@ def _import_plugin_server(plugin_path, module_name):
 
 
 memory_server = _import_plugin_server(memory_file_path, "memory_server")
-scheduler_server = _import_plugin_server(scheduler_cron_path, "scheduler_server")
 approval_server = _import_plugin_server(approval_channel_path, "approval_server")
+# Scheduling is now built into taskpilot — use taskpilot_server directly
+scheduler_server = taskpilot_server
 
 
 class FakeCrontab:
@@ -109,14 +109,16 @@ def integrated_env(tmp_path):
     with (
         patch.object(spawner, "TASKPILOT_DIR", tmp_path),
         patch.object(memory_server, "TASKPILOT_DIR", tmp_path),
-        patch.object(scheduler_server, "TASKPILOT_DIR", tmp_path),
-        patch.object(scheduler_server, "SCHEDULES_FILE", tmp_path / "schedules.json"),
-        patch.object(scheduler_server, "_get_current_crontab", side_effect=lambda: fake_cron.get()),
-        patch.object(scheduler_server, "_set_crontab", side_effect=lambda c: fake_cron.set(c) or True),
-        patch.object(approval_server, "TASKPILOT_DIR", tmp_path),
-        patch.object(approval_server, "_post_to_channel", return_value=True),
+        patch.object(taskpilot_server, "TASKPILOT_DIR", tmp_path),
+        patch.object(taskpilot_server, "SCHEDULES_FILE", tmp_path / "schedules.json"),
+        patch.object(taskpilot_server, "_get_current_crontab", side_effect=lambda: fake_cron.get()),
+        patch.object(taskpilot_server, "_set_crontab", side_effect=lambda c: fake_cron.set(c) or True),
+        patch.object(taskpilot_server, "_get_task_port", return_value=task["port"]),
+        patch.object(approval_server, "DATA_DIR", tmp_path, create=True),
+        patch.object(approval_server, "_post_to_channel", return_value=True, create=True),
     ):
         os.environ["TASKPILOT_TASK_ID"] = task_id
+        os.environ["APPROVAL_SESSION_ID"] = task_id
 
         # Write task config (CLAUDE.md + brief.json)
         spawner.write_task_config(
@@ -137,6 +139,7 @@ def integrated_env(tmp_path):
         }
 
         del os.environ["TASKPILOT_TASK_ID"]
+        del os.environ["APPROVAL_SESSION_ID"]
 
 
 class TestTaskCreation:

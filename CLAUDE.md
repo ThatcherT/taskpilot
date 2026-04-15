@@ -71,6 +71,9 @@ claude --plugin-dir /home/thatcher/projects/softwaresoftware/projects/plugins/pr
 - `send_message(task_id, message)` — POST to channel
 - `kill_task(task_id)` — kill tmux + clean up
 - `get_task_log(task_id, lines?)` — capture tmux pane output
+- `schedule_task(name, plugin, skill, interval, enabled?)` — create/update a cron schedule
+- `list_scheduled_tasks()` — list schedules for current task
+- `remove_scheduled_task(name)` — remove a schedule and its crontab entry
 
 ## Operating Brief
 
@@ -83,7 +86,7 @@ The `operating_brief` parameter to `create_task` accepts a dict with:
 | `success_criteria` | list[str] | Completion conditions |
 | `boundaries` | list[str] | What NOT to do |
 | `capabilities` | list[str] | Required capabilities (auto-resolved via nov-dependency-resolver) |
-| `schedule` | str | Cron expression for recurring agents |
+| `schedule` | str | Cron expression for recurring agents (scheduling is built-in) |
 
 Capabilities declared in the brief are automatically resolved to provider plugins via nov-dependency-resolver at task creation time. The agent's CLAUDE.md is dynamically generated with sections for each declared capability.
 
