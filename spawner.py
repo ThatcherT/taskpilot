@@ -356,7 +356,7 @@ def unregister_channel_mcp(task_id: str) -> None:
 
 
 def tmux_session_name(task_id: str) -> str:
-    return f"taskpilot-{task_id}"
+    return task_id
 
 
 def spawn_tmux(task_id: str, port: int, plugins: list[str], model: str | None = None,
@@ -497,7 +497,7 @@ CLAUDE_BIN = _claude or "claude"
 
 
 def _systemd_unit_name(task_id: str) -> str:
-    return f"taskpilot-{task_id}"
+    return task_id
 
 
 def _systemd_unit_path(task_id: str) -> Path:

@@ -26,7 +26,7 @@ conn.close()
 orphaned = []
 for t in tasks:
     tid = t['task_id']
-    session = f'taskpilot-{tid}'
+    session = tid
     result = subprocess.run(['tmux', 'has-session', '-t', session], capture_output=True)
     if result.returncode != 0:
         orphaned.append({'task_id': tid, 'port': t['port']})
