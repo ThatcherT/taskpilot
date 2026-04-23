@@ -73,22 +73,17 @@ def main():
         # Write config files
         spawner.write_task_config(task_id, name, args.description, plugins, operating_brief)
 
-        # Register channel MCP
-        spawner.register_channel_mcp(task_id, task["port"])
-
         if args.dry_run:
             print(json.dumps({
                 "ok": True,
                 "dry_run": True,
                 "task_id": task_id,
-                "port": task["port"],
             }))
             return
 
         # Spawn tmux session (~16s for startup dialogs)
-        success = spawner.spawn_tmux(task_id, task["port"], plugins, cwd=cwd, channels=channels)
+        success = spawner.spawn_tmux(task_id, plugins, cwd=cwd, channels=channels)
         if not success:
-            spawner.unregister_channel_mcp(task_id)
             print(json.dumps({"ok": False, "error": "Failed to launch tmux session"}))
             sys.exit(1)
 
@@ -98,14 +93,14 @@ def main():
         store.increment_invocation(conn, task_id)
         conn.close()
 
-        # Send initial prompt
-        spawner.send_initial_prompt(task["port"], args.description)
+        # Send initial prompt via session-bridge
+        spawner.send_initial_prompt(task_id, args.description)
 
         # Start task relay (forwards SSE replies to phone)
         relay_script = Path(__file__).parent / "task_relay.sh"
         if relay_script.exists():
             subprocess.Popen(
-                ["bash", str(relay_script), task_id, str(task["port"])],
+                ["bash", str(relay_script), task_id],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -114,9 +109,8 @@ def main():
         print(json.dumps({
             "ok": True,
             "task_id": task_id,
-            "port": task["port"],
             "tmux_session": spawner.tmux_session_name(task_id),
-            "channel_healthy": spawner.channel_healthy(task["port"]),
+            "channel_healthy": spawner.channel_healthy(task_id),
         }))
 
     except Exception as e:

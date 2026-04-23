@@ -1,6 +1,6 @@
 # CLAUDE.md — taskpilot
 
-Spawn and manage long-running autonomous Claude Code sessions. Each task runs in its own tmux session with a channel MCP for real-time communication.
+Spawn and manage long-running autonomous Claude Code sessions. Each task runs in its own tmux session, addressable through session-bridge by its task id.
 
 ## Quick Reference
 
@@ -13,24 +13,24 @@ Spawn and manage long-running autonomous Claude Code sessions. Each task runs in
 ## Stack
 
 - Python 3.11+, FastMCP, SQLite
-- Node.js (channel MCP server)
 - tmux (session management)
+- session-bridge (message routing)
 
 ## How It Works
 
-1. `create_task()` writes config to `~/.taskpilot/<id>/`, allocates a port, registers channel MCP in `~/.claude.json`
+1. `create_task()` writes config to `~/.taskpilot/<id>/`.
 2. `spawn_task()` launches the agent:
-   - **`kind=task`** (default): launches directly in tmux
-   - **`kind=service`**: generates `start.sh` + systemd user service, survives reboots
-3. The initial task prompt is POSTed to the channel after startup
-4. The agent works autonomously, writing state.json after each major action
-5. Messages flow via HTTP POST to the channel port; replies come back on SSE `/events`
-6. On crash, the while-loop in tmux respawns via `rotation.py`
-7. Task completes when the agent writes `"phase": "done"` to state.json
+   - **`kind=task`** (default): launches directly in tmux.
+   - **`kind=service`**: generates `start.sh` + systemd user service, survives reboots.
+3. Claude is launched with `--name <task_id>`. session-bridge's `channel.mjs` parses that flag from `/proc/<ppid>/cmdline` at MCP boot and registers the session under that name — no agent-side `set_name` call required.
+4. The initial task prompt is POSTed to `http://127.0.0.1:8910/sessions/<task_id>/message`.
+5. External callers (taskboard "msg" button, cron schedules) send messages the same way.
+6. On crash, the while-loop in tmux respawns via `rotation.py`.
+7. Task completes when the agent writes `"phase": "done"` to state.json.
 
 ## Service Persistence
 
-Agents created with `kind="service"` get a systemd user service (`taskpilot-<id>.service`) that auto-starts on boot. The pattern matches beats-dj: systemd runs a startup script that launches tmux + Claude, with a `while tmux has-session` tail loop for lifecycle tracking.
+Agents created with `kind="service"` get a systemd user service (`taskpilot-<id>.service`) that auto-starts on boot. Systemd runs `start.sh`, which launches tmux + Claude with a `while tmux has-session` tail loop for lifecycle tracking.
 
 - Start script: `~/.taskpilot/<id>/start.sh`
 - Systemd unit: `~/.config/systemd/user/taskpilot-<id>.service`
@@ -39,10 +39,9 @@ Agents created with `kind="service"` get a systemd user service (`taskpilot-<id>
 
 ## Architecture
 
-- Channel MCP servers registered in `~/.claude.json` (NOT settings.json)
-- Node path must be absolute (nvm not in MCP subprocess PATH)
-- Trust dialog + channels warning auto-accepted via `tmux send-keys Enter`
-- Each task gets a unique port (9100+)
+- Messaging routes through the session-bridge daemon at `http://127.0.0.1:8910`.
+- Project-scoped MCPs from the task's `cwd/.claude/settings.json` are registered into `~/.claude.json` at launch (and cleaned up on kill via `project_mcps.json`).
+- Trust dialog + channels warning auto-accepted via `tmux send-keys Enter`.
 
 ## Data
 

@@ -80,10 +80,6 @@ def create_task(
     # Write config files
     spawner.write_task_config(task_id, name, description, plugins, operating_brief)
 
-    # Register channel MCP in .claude.json (for kind=task; services handle this in start.sh)
-    if kind == "task":
-        spawner.register_channel_mcp(task_id, task["port"])
-
     return task
 
 
@@ -110,7 +106,6 @@ def spawn_task(task_id: str) -> dict:
         return {"error": f"Task '{task_id}' is already running"}
 
     plugins = json.loads(task["plugins"]) if task["plugins"] else []
-    port = task["port"]
     model = task.get("model")
     cwd = task.get("cwd")
     channels = json.loads(task["channels"]) if task.get("channels") else []
@@ -118,12 +113,12 @@ def spawn_task(task_id: str) -> dict:
 
     if kind == "service":
         # Generate startup script and install systemd service
-        spawner.write_service_script(task_id, port, plugins, model=model, cwd=cwd, channels=channels)
+        spawner.write_service_script(task_id, plugins, model=model, cwd=cwd, channels=channels)
         spawner.install_service(task_id)
 
-        # Poll for channel health (systemd starts the script which starts tmux)
+        # Poll session-bridge for the task to become reachable
         for _ in range(40):
-            if spawner.channel_healthy(port):
+            if spawner.channel_healthy(task_id):
                 break
             time.sleep(1)
 
@@ -135,16 +130,15 @@ def spawn_task(task_id: str) -> dict:
         return {
             "status": "running",
             "task_id": task_id,
-            "port": port,
             "kind": "service",
             "tmux_session": spawner.tmux_session_name(task_id),
             "systemd_service": spawner._systemd_unit_name(task_id),
             "systemd_active": spawner.is_service_active(task_id),
-            "channel_healthy": spawner.channel_healthy(port),
+            "channel_healthy": spawner.channel_healthy(task_id),
         }
     else:
         # Standard task — launch directly in tmux
-        success = spawner.spawn_tmux(task_id, port, plugins, model=model, cwd=cwd, channels=channels)
+        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels)
         if not success:
             conn.close()
             return {"error": "Failed to launch tmux session"}
@@ -154,16 +148,15 @@ def spawn_task(task_id: str) -> dict:
         store.increment_invocation(conn, task_id)
         conn.close()
 
-        # Send initial task prompt
-        spawner.send_initial_prompt(port, task["description"])
+        # Send initial task prompt via session-bridge
+        spawner.send_initial_prompt(task_id, task["description"])
 
         return {
             "status": "running",
             "task_id": task_id,
-            "port": port,
             "kind": "task",
             "tmux_session": spawner.tmux_session_name(task_id),
-            "channel_healthy": spawner.channel_healthy(port),
+            "channel_healthy": spawner.channel_healthy(task_id),
         }
 
 
@@ -184,7 +177,7 @@ def list_tasks(status: str | None = None) -> list[dict]:
     # Enrich with live status
     for t in tasks:
         t["tmux_alive"] = spawner.is_tmux_alive(t["task_id"])
-        t["channel_healthy"] = spawner.channel_healthy(t["port"])
+        t["channel_healthy"] = spawner.channel_healthy(t["task_id"])
         if t.get("kind") == "service":
             t["systemd_active"] = spawner.is_service_active(t["task_id"])
     return tasks
@@ -207,7 +200,7 @@ def get_task(task_id: str) -> dict:
         return {"error": f"Task '{task_id}' not found"}
 
     task["tmux_alive"] = spawner.is_tmux_alive(task_id)
-    task["channel_healthy"] = spawner.channel_healthy(task["port"])
+    task["channel_healthy"] = spawner.channel_healthy(task_id)
     if task.get("kind") == "service":
         task["systemd_active"] = spawner.is_service_active(task_id)
 
@@ -241,13 +234,14 @@ def send_message(task_id: str, message: str) -> dict:
     if not task:
         return {"error": f"Task '{task_id}' not found"}
 
-    port = task["port"]
-    if not spawner.channel_healthy(port):
-        return {"error": f"Channel on port {port} is not responding"}
+    if not spawner.channel_healthy(task_id):
+        return {"error": f"Task '{task_id}' is not reachable via session-bridge"}
 
+    payload = json.dumps({"text": message, "from_session": "taskpilot-mcp"})
     try:
         result = subprocess.run(
-            ["curl", "-s", "-d", message, f"http://localhost:{port}"],
+            ["curl", "-s", "-X", "POST", "-H", "Content-Type: application/json",
+             "-d", payload, f"{spawner.SESSION_BRIDGE_URL}/sessions/{task_id}/message"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -285,8 +279,8 @@ def kill_task(task_id: str) -> dict:
     # Kill tmux (safety net for services, primary for tasks)
     tmux_killed = spawner.kill_tmux(task_id)
 
-    # Unregister channel MCP
-    spawner.unregister_channel_mcp(task_id)
+    # Clean up project-scoped MCPs this task registered
+    spawner.cleanup_project_mcps(task_id)
 
     # Update DB
     store.update_status(conn, task_id, "killed")
@@ -482,14 +476,6 @@ def _human_to_cron(interval: str) -> str | None:
     return None
 
 
-def _get_task_port(task_id: str) -> int | None:
-    """Look up the channel port for a task from taskpilot.db."""
-    conn = store.get_db()
-    task = store.get_task(conn, task_id)
-    conn.close()
-    return task["port"] if task else None
-
-
 @mcp.tool()
 def schedule_task(
     name: str,
@@ -500,8 +486,9 @@ def schedule_task(
 ) -> dict:
     """Schedule a recurring task event via crontab.
 
-    Creates a crontab entry that posts a message to the agent's channel port
-    on the specified interval. The agent receives the message and decides what to do.
+    Creates a crontab entry that POSTs a message to the agent's session-bridge
+    channel on the specified interval. The agent receives the message and
+    decides what to do.
 
     Args:
         name: Unique name for this schedule (e.g., "daily-research", "price-check").
@@ -518,13 +505,18 @@ def schedule_task(
         return {"error": f"Invalid interval: '{interval}'. Use cron (5 fields), 'every Xm/Xh/Xd', 'daily', 'hourly', or 'weekly'."}
 
     task_id = os.environ.get("TASKPILOT_TASK_ID", "unknown")
-    port = _get_task_port(task_id)
-    if not port:
-        return {"error": "Cannot determine channel port. Is TASKPILOT_TASK_ID set?"}
+    if task_id == "unknown":
+        return {"error": "Cannot determine task id. Is TASKPILOT_TASK_ID set?"}
 
     tag = _schedule_tag(task_id, name)
     message = f"[scheduled:{name}] Time to run {skill} (plugin: {plugin})"
-    cron_line = f'{cron_expr} curl -s -d "{message}" http://localhost:{port} > /dev/null 2>&1 {tag}'
+    payload = json.dumps({"text": message, "from_session": "cron"})
+    target_url = f"{spawner.SESSION_BRIDGE_URL}/sessions/{task_id}/message"
+    # Crontab-safe: single-quote the JSON body, escape inner single quotes.
+    cron_line = (
+        f"{cron_expr} curl -s -X POST -H 'Content-Type: application/json' "
+        f"-d {json.dumps(payload)} {target_url} > /dev/null 2>&1 {tag}"
+    )
 
     # Update crontab
     current = _get_current_crontab()
@@ -546,7 +538,7 @@ def schedule_task(
         "skill": skill,
         "interval": interval,
         "cron_expr": cron_expr,
-        "port": port,
+        "target_url": target_url,
         "enabled": enabled,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -556,7 +548,7 @@ def schedule_task(
         "scheduled": True,
         "name": name,
         "cron_expr": cron_expr,
-        "port": port,
+        "target_url": target_url,
         "message": message,
         "enabled": enabled,
     }

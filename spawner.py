@@ -1,4 +1,10 @@
-"""Spawner — writes config files, registers channel MCP, launches tmux session."""
+"""Spawner — writes config files, launches tmux session.
+
+Messaging goes through session-bridge (localhost:8910). Agents are
+addressable by task_id because claude is launched with --name <task_id>,
+which session-bridge's channel.mjs parses from /proc/<ppid>/cmdline at
+registration time.
+"""
 
 import json
 import os
@@ -12,31 +18,13 @@ from pathlib import Path
 TASKPILOT_DIR = Path.home() / ".taskpilot"
 CLAUDE_JSON = Path.home() / ".claude.json"
 PLUGIN_ROOT = Path(__file__).parent
-CHANNEL_TEMPLATE = PLUGIN_ROOT / "channel_template.mjs"
+SESSION_BRIDGE_URL = "http://127.0.0.1:8910"
 
 # Marketplace and plugin registry paths
 CLAUDE_DIR = Path.home() / ".claude"
 MARKETPLACE_PATH = CLAUDE_DIR / "plugins" / "marketplaces" / "softwaresoftware-plugins" / ".claude-plugin" / "marketplace.json"
 INSTALLED_PLUGINS_PATH = CLAUDE_DIR / "plugins" / "installed_plugins.json"
 PLUGIN_CACHE_DIR = CLAUDE_DIR / "plugins" / "cache" / "softwaresoftware-plugins"
-
-# Absolute node path — nvm isn't in MCP subprocess PATH, and /usr/bin/node
-# is v12 which can't run ES modules with top-level await.
-# Must resolve to a node >= 18.
-_node = shutil.which("node")
-if _node and os.path.realpath(_node).startswith("/usr"):
-    # System node is too old, find nvm version
-    _node = None
-if not _node:
-    nvm_dir = Path.home() / ".nvm" / "versions" / "node"
-    if nvm_dir.exists():
-        versions = sorted(nvm_dir.iterdir(), reverse=True)
-        for v in versions:
-            candidate = v / "bin" / "node"
-            if candidate.exists():
-                _node = str(candidate)
-                break
-NODE_BIN = _node or "/usr/bin/node"
 
 
 def slugify(name: str) -> str:
@@ -318,40 +306,26 @@ def resolve_capabilities(capabilities: list[str]) -> list[str]:
     return resolved_paths
 
 
-def register_channel_mcp(task_id: str, port: int) -> None:
-    """Add the task's channel MCP server to ~/.claude.json."""
-    server_name = f"task-{task_id}"
-    channel_path = str(CHANNEL_TEMPLATE)
+def cleanup_project_mcps(task_id: str) -> None:
+    """Remove any project-scoped MCPs this task registered into ~/.claude.json.
 
-    data = json.loads(CLAUDE_JSON.read_text())
-    data.setdefault("mcpServers", {})
-    data["mcpServers"][server_name] = {
-        "command": NODE_BIN,
-        "args": [channel_path],
-        "env": {
-            "TASKPILOT_PORT": str(port),
-            "TASKPILOT_NAME": server_name,
-        },
-    }
-    CLAUDE_JSON.write_text(json.dumps(data, indent=2))
-
-
-def unregister_channel_mcp(task_id: str) -> None:
-    """Remove the task's channel MCP server and project MCPs from ~/.claude.json."""
-    server_name = f"task-{task_id}"
+    Project MCPs are registered at startup from the task cwd's
+    .claude/settings.json (names recorded in project_mcps.json). We
+    remove them when the task is torn down.
+    """
+    pmcps_file = task_dir(task_id) / "project_mcps.json"
+    if not pmcps_file.exists():
+        return
+    try:
+        names = json.loads(pmcps_file.read_text())
+    except Exception:
+        return
+    if not names:
+        return
     data = json.loads(CLAUDE_JSON.read_text())
     mcps = data.get("mcpServers", {})
-    mcps.pop(server_name, None)
-
-    # Also clean up project-scoped MCPs
-    pmcps_file = task_dir(task_id) / "project_mcps.json"
-    if pmcps_file.exists():
-        try:
-            for name in json.loads(pmcps_file.read_text()):
-                mcps.pop(name, None)
-        except Exception:
-            pass
-
+    for name in names:
+        mcps.pop(name, None)
     CLAUDE_JSON.write_text(json.dumps(data, indent=2))
 
 
@@ -359,11 +333,10 @@ def tmux_session_name(task_id: str) -> str:
     return task_id
 
 
-def spawn_tmux(task_id: str, port: int, plugins: list[str], model: str | None = None,
+def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
                cwd: str | None = None, channels: list[str] | None = None) -> bool:
-    """Launch the Claude session in tmux with channel."""
+    """Launch the Claude session in tmux. Messaging goes through session-bridge."""
     session = tmux_session_name(task_id)
-    server_name = f"task-{task_id}"
     td = cwd or str(task_dir(task_id))
 
     # Build plugin-dir flags
@@ -374,8 +347,8 @@ def spawn_tmux(task_id: str, port: int, plugins: list[str], model: str | None = 
     # Build model flag
     model_flag = f" --model {model}" if model else ""
 
-    # Build dev channels flag — always include the task's own channel
-    all_channels = [f"server:{server_name}"]
+    # Build dev channels flag — session-bridge is the only channel
+    all_channels = ["server:session-bridge"]
     for ch in (channels or []):
         if ch not in all_channels:
             all_channels.append(ch)
@@ -411,34 +384,26 @@ done"""
     time.sleep(4)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
 
-    # Wait for channel health
+    # Wait for session-bridge to see the session with a channel port.
+    # session-bridge channel.mjs parses --name from claude's cmdline and
+    # registers us under task_id, so we can poll by name.
     for _ in range(20):
-        try:
-            resp = subprocess.run(
-                ["curl", "-sf", f"http://localhost:{port}/health"],
-                capture_output=True,
-                timeout=3,
-            )
-            if resp.returncode == 0:
-                break
-        except subprocess.TimeoutExpired:
-            pass
+        if channel_healthy(task_id):
+            break
         time.sleep(1)
-
-    # Unregister from .claude.json now that the task session owns the MCP process.
-    # This prevents other Claude sessions from stealing the channel.
-    unregister_channel_mcp(task_id)
 
     # Brief settle time for MCP connection
     time.sleep(3)
     return True
 
 
-def send_initial_prompt(port: int, description: str) -> bool:
-    """POST the initial task prompt to the channel."""
+def send_initial_prompt(task_id: str, description: str) -> bool:
+    """POST the initial task prompt via session-bridge."""
+    payload = json.dumps({"text": description, "from_session": "taskpilot-spawner"})
     try:
         result = subprocess.run(
-            ["curl", "-s", "-d", description, f"http://localhost:{port}"],
+            ["curl", "-s", "-X", "POST", "-H", "Content-Type: application/json",
+             "-d", payload, f"{SESSION_BRIDGE_URL}/sessions/{task_id}/message"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -468,16 +433,20 @@ def is_tmux_alive(task_id: str) -> bool:
     return result.returncode == 0
 
 
-def channel_healthy(port: int) -> bool:
-    """Check if the channel HTTP server is responding."""
+def channel_healthy(task_id: str) -> bool:
+    """Check if session-bridge has a registered channel for this task."""
     try:
         result = subprocess.run(
-            ["curl", "-sf", f"http://localhost:{port}/health"],
+            ["curl", "-sf", f"{SESSION_BRIDGE_URL}/sessions/{task_id}"],
             capture_output=True,
+            text=True,
             timeout=3,
         )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
+        if result.returncode != 0:
+            return False
+        data = json.loads(result.stdout)
+        return data.get("channel_port") is not None
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, ValueError):
         return False
 
 
@@ -506,21 +475,23 @@ def _systemd_unit_path(task_id: str) -> Path:
 
 def write_service_script(
     task_id: str,
-    port: int,
     plugins: list[str],
     model: str | None = None,
     cwd: str | None = None,
     channels: list[str] | None = None,
 ) -> Path:
-    """Generate start.sh for a kind=service agent, modeled on beats-dj's dj-start.sh."""
+    """Generate start.sh for a kind=service agent.
+
+    Messaging routes through session-bridge (localhost:8910). Agent is
+    addressable by task_id because claude is launched with --name <task_id>
+    and session-bridge auto-names from that at /register time.
+    """
     td = task_dir(task_id)
     td.mkdir(parents=True, exist_ok=True)
     script_path = td / "start.sh"
 
     session = tmux_session_name(task_id)
     project_dir = cwd or str(td)
-    server_name = f"task-{task_id}"
-    channel_path = str(CHANNEL_TEMPLATE)
 
     # Build plugin-dir flags
     plugin_flags = ""
@@ -530,8 +501,8 @@ def write_service_script(
     # Build model flag
     model_flag = f" --model {model}" if model else ""
 
-    # Build dev channels — always include the task's own channel
-    all_channels = [f"server:{server_name}"]
+    # Build dev channels — session-bridge is the only channel
+    all_channels = ["server:session-bridge"]
     for ch in (channels or []):
         if ch not in all_channels:
             all_channels.append(ch)
@@ -551,33 +522,26 @@ source "$HOME/.bashrc" 2>/dev/null || true
 SESSION="{session}"
 PROJECT_DIR="{project_dir}"
 CLAUDE="{CLAUDE_BIN}"
-PORT="{port}"
 TASK_ID="{task_id}"
+SESSION_BRIDGE_URL="http://127.0.0.1:8910"
 
 # Kill stale tmux session if any
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 sleep 1
 
-# Register channel MCP + any project-scoped MCPs in ~/.claude.json
+# Register project-scoped MCPs from cwd/.claude/settings.json into ~/.claude.json
+# so claude picks them up at launch. We track which we added in project_mcps.json
+# so kill_task can clean them up on teardown.
 python3 -c "
-import json, os
+import json, shutil
 from pathlib import Path
 
 p = Path.home() / '.claude.json'
 d = json.loads(p.read_text())
 d.setdefault('mcpServers', {{}})
 
-# Register taskpilot channel
-d['mcpServers']['{server_name}'] = {{
-    'command': '{NODE_BIN}',
-    'args': ['{channel_path}'],
-    'env': {{'TASKPILOT_PORT': '{port}', 'TASKPILOT_NAME': '{server_name}'}}
-}}
-
-# Register project-scoped MCPs from cwd/.claude/settings.json
-# Resolve node/npx commands to absolute paths since Claude MCP spawner
+# Resolve node/npx commands to absolute paths since claude's MCP spawner
 # doesn't inherit the shell PATH (nvm etc won't be available)
-import shutil
 _node_cmds = {{'node', 'npx', 'tsx'}}
 def _resolve_cmd(cmd):
     if cmd in _node_cmds:
@@ -598,7 +562,6 @@ if project_settings.exists():
             _taskpilot_project_mcps.append(name)
     except Exception:
         pass
-# Save list of project MCPs for cleanup
 (Path.home() / '.taskpilot' / '{task_id}' / 'project_mcps.json').write_text(
     json.dumps(_taskpilot_project_mcps)
 )
@@ -625,33 +588,31 @@ sleep 4
 # Auto-accept channels warning
 tmux send-keys -t "$SESSION" Enter
 
-# Wait for channel health
+# Wait for session-bridge to see the task by name with a live channel port.
+# session-bridge's channel.mjs parses --name from claude's /proc/<ppid>/cmdline
+# and registers us under $TASK_ID automatically.
 for i in $(seq 1 30); do
-    if curl -sf -m 2 "http://localhost:$PORT/health" >/dev/null 2>&1; then
+    if curl -sf -m 2 "$SESSION_BRIDGE_URL/sessions/$TASK_ID" \\
+         | python3 -c "import sys, json; d = json.load(sys.stdin); sys.exit(0 if d.get('channel_port') else 1)" \\
+         2>/dev/null; then
         break
     fi
     sleep 1
 done
 
-# Unregister taskpilot channel MCP — the task session now owns it
-# Project MCPs stay in ~/.claude.json so they persist across context rotations
-python3 -c "
-import json
-from pathlib import Path
-
-p = Path.home() / '.claude.json'
-d = json.loads(p.read_text())
-mcps = d.get('mcpServers', {{}})
-mcps.pop('{server_name}', None)
-p.write_text(json.dumps(d, indent=2))
-"
-
 # Brief settle time
 sleep 3
 
-# Send initial task prompt
+# Send initial task prompt via session-bridge
 if [ -f "$HOME/.taskpilot/$TASK_ID/prompt.txt" ]; then
-    curl -s -d @"$HOME/.taskpilot/$TASK_ID/prompt.txt" "http://localhost:$PORT" || true
+    PROMPT_BODY=$(python3 -c "
+import json, sys
+text = open('$HOME/.taskpilot/$TASK_ID/prompt.txt').read()
+sys.stdout.write(json.dumps({{'text': text, 'from_session': 'taskpilot-spawner'}}))
+")
+    curl -s -X POST -H 'Content-Type: application/json' \\
+         -d "$PROMPT_BODY" \\
+         "$SESSION_BRIDGE_URL/sessions/$TASK_ID/message" > /dev/null || true
 fi
 
 echo "taskpilot service '$TASK_ID' started in tmux session '$SESSION'"

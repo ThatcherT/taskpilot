@@ -113,7 +113,6 @@ def integrated_env(tmp_path):
         patch.object(taskpilot_server, "SCHEDULES_FILE", tmp_path / "schedules.json"),
         patch.object(taskpilot_server, "_get_current_crontab", side_effect=lambda: fake_cron.get()),
         patch.object(taskpilot_server, "_set_crontab", side_effect=lambda c: fake_cron.set(c) or True),
-        patch.object(taskpilot_server, "_get_task_port", return_value=task["port"]),
         patch.object(approval_server, "DATA_DIR", tmp_path, create=True),
         patch.object(approval_server, "_post_to_channel", return_value=True, create=True),
     ):
@@ -244,10 +243,10 @@ class TestSchedulerCapability:
         assert result["scheduled"] is True
         assert result["cron_expr"] == "0 9 * * *"
 
-        # Verify crontab has the entry
+        # Verify crontab has the entry posting via session-bridge
         cron = integrated_env["fake_cron"].content
         assert "daily-reddit-mine" in cron
-        assert f"localhost:{integrated_env['task']['port']}" in cron
+        assert f"127.0.0.1:8910/sessions/{integrated_env['task_id']}/message" in cron
 
     def test_multiple_schedules(self, integrated_env):
         scheduler_server.schedule_task("morning-research", "gummymine", "mine", "daily")
