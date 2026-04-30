@@ -73,6 +73,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN kind TEXT DEFAULT 'task'")
         conn.commit()
 
+    # Migrate: host column (which mesh host the task runs on; NULL = local)
+    try:
+        conn.execute("SELECT host FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN host TEXT DEFAULT NULL")
+        conn.commit()
+
 
 def allocate_port(conn: sqlite3.Connection) -> int:
     """Find the next available port starting from PORT_RANGE_START."""
@@ -94,14 +101,15 @@ def create_task(
     cwd: str | None = None,
     channels: list[str] | None = None,
     kind: str = "task",
+    host: str | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind, host)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
          json.dumps(plugins or []), json.dumps(operating_brief or {}), model,
-         cwd, json.dumps(channels or []), kind),
+         cwd, json.dumps(channels or []), kind, host),
     )
     conn.commit()
     return get_task(conn, task_id)

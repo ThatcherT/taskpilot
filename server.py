@@ -28,6 +28,7 @@ def create_task(
     cwd: str | None = None,
     channels: list[str] | None = None,
     kind: str = "task",
+    host: str | None = None,
 ) -> dict:
     """Create a new autonomous task. Writes config files and allocates a channel port.
 
@@ -46,12 +47,19 @@ def create_task(
         cwd: Optional working directory for the task (default: ~/.taskpilot/<task_id>/).
         channels: Optional additional dev channel servers (e.g. ["server:session-bridge"]).
         kind: "task" for one-shot jobs, "service" for always-on agents that survive reboots.
+        host: Optional mesh hostname to spawn on (e.g. "pixel-7-pro"). When set
+            and not the local host, spawn_task forwards the launch to that
+            peer's session-bridge daemon. None or self-host = local launch.
+            kind="service" is not yet supported for remote hosts.
 
     Returns:
         Task record with task_id, port, and status.
     """
     if kind not in ("task", "service"):
         return {"error": f"Invalid kind '{kind}'. Must be 'task' or 'service'."}
+
+    if host and kind == "service":
+        return {"error": "kind=service is not yet supported on remote hosts (no remote systemd install)"}
 
     task_id = spawner.slugify(name)
     plugins = plugins or []
@@ -74,7 +82,7 @@ def create_task(
         conn.close()
         return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
 
-    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels, kind=kind)
+    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels, kind=kind, host=host)
     conn.close()
 
     # Write config files
@@ -110,6 +118,27 @@ def spawn_task(task_id: str) -> dict:
     cwd = task.get("cwd")
     channels = json.loads(task["channels"]) if task.get("channels") else []
     kind = task.get("kind", "task")
+    host = task.get("host")
+
+    # Remote host? Forward to that host's session-bridge /spawn. The peer's
+    # daemon does the tmux + claude work and waits for registration.
+    if host and not spawner.is_self_host(host):
+        result = spawner.spawn_remote(task)
+        if not result.get("spawned"):
+            conn.close()
+            return {"error": result.get("error", "remote spawn failed")}
+        store.update_status(conn, task_id, "running")
+        store.increment_invocation(conn, task_id)
+        conn.close()
+        return {
+            "status": "running",
+            "task_id": task_id,
+            "kind": "task",
+            "host": host,
+            "remote_session_id": result.get("session_id"),
+            "tmux_session": result.get("tmux_session"),
+            "channel_healthy": True,  # peer confirmed registration before returning
+        }
 
     if kind == "service":
         # Generate startup script and install systemd service

@@ -114,3 +114,116 @@ class TestCreateTaskIntegration:
             server.create_task(name="dup task", description="first")
             result = server.create_task(name="dup task", description="second")
             assert "error" in result
+
+    def test_create_with_host(self, db_path, tmp_path):
+        """host parameter is stored on the task row for spawn_task to consult."""
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+
+            result = server.create_task(
+                name="phone task",
+                description="send a text",
+                host="pixel-7-pro",
+            )
+            assert "error" not in result, result
+            assert result.get("host") == "pixel-7-pro"
+
+            conn = _real_get_db(db_path)
+            stored = store.get_task(conn, "phone-task")
+            conn.close()
+            assert stored["host"] == "pixel-7-pro"
+
+    def test_create_rejects_remote_service_kind(self, db_path, tmp_path):
+        """Remote /spawn doesn't currently install systemd; reject up front."""
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+
+            result = server.create_task(
+                name="phone svc",
+                description="x",
+                host="pixel-7-pro",
+                kind="service",
+            )
+            assert "error" in result
+            assert "service" in result["error"].lower()
+
+
+class TestSpawnTaskHostDispatch:
+    """spawn_task branches on task.host: local tmux vs forward to peer /spawn."""
+
+    def test_spawn_remote_host_calls_spawn_remote(self, db_path, tmp_path):
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+            server.create_task(name="phone task", description="hi", host="pixel-7-pro")
+
+            with (
+                patch.object(spawner, "is_self_host", return_value=False),
+                patch.object(spawner, "spawn_remote", return_value={
+                    "spawned": True,
+                    "session_id": "remote-uuid",
+                    "tmux_session": "spawn-phone-task.taskpilot",
+                }) as mock_remote,
+            ):
+                result = server.spawn_task("phone-task")
+
+            assert mock_remote.called
+            assert result["status"] == "running"
+            assert result["host"] == "pixel-7-pro"
+            assert result["remote_session_id"] == "remote-uuid"
+
+    def test_spawn_remote_failure_surfaces_error(self, db_path, tmp_path):
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+            server.create_task(name="phone task", description="hi", host="pixel-7-pro")
+
+            with (
+                patch.object(spawner, "is_self_host", return_value=False),
+                patch.object(spawner, "spawn_remote", return_value={
+                    "spawned": False,
+                    "error": "peer pixel-7-pro unreachable: connection refused",
+                }),
+            ):
+                result = server.spawn_task("phone-task")
+
+            assert "error" in result
+            assert "pixel-7-pro" in result["error"]
+
+    def test_spawn_self_host_falls_through_to_local(self, db_path, tmp_path):
+        """host=local-yocal where local-yocal is self → existing local tmux path."""
+        with (
+            patch("server.store.get_db", side_effect=lambda: _real_get_db(db_path)),
+            patch.object(spawner, "TASKPILOT_DIR", tmp_path),
+            patch.object(spawner, "CLAUDE_JSON", tmp_path / ".claude.json"),
+        ):
+            (tmp_path / ".claude.json").write_text('{"mcpServers": {}}')
+            server.create_task(name="local task", description="hi", host="local-yocal")
+
+            with (
+                patch.object(spawner, "is_self_host", return_value=True),
+                patch.object(spawner, "spawn_remote") as mock_remote,
+                patch.object(spawner, "spawn_tmux", return_value=True) as mock_local,
+                patch.object(spawner, "send_initial_prompt"),
+                patch.object(spawner, "channel_healthy", return_value=True),
+                patch.object(spawner, "tmux_session_name", return_value="taskpilot-local-task"),
+            ):
+                result = server.spawn_task("local-task")
+
+            mock_remote.assert_not_called()
+            mock_local.assert_called_once()
+            assert result["status"] == "running"

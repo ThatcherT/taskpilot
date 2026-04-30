@@ -8,11 +8,12 @@ registration time.
 
 import json
 import os
-import platform
 import re
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 TASKPILOT_DIR = Path.home() / ".taskpilot"
@@ -20,11 +21,8 @@ CLAUDE_JSON = Path.home() / ".claude.json"
 PLUGIN_ROOT = Path(__file__).parent
 SESSION_BRIDGE_URL = "http://127.0.0.1:8910"
 
-# Marketplace and plugin registry paths
-CLAUDE_DIR = Path.home() / ".claude"
-MARKETPLACE_PATH = CLAUDE_DIR / "plugins" / "marketplaces" / "softwaresoftware-plugins" / ".claude-plugin" / "marketplace.json"
-INSTALLED_PLUGINS_PATH = CLAUDE_DIR / "plugins" / "installed_plugins.json"
-PLUGIN_CACHE_DIR = CLAUDE_DIR / "plugins" / "cache" / "softwaresoftware-plugins"
+# User-scope plugin registry — taskpilot only uses what's already installed.
+INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
 
 
 def slugify(name: str) -> str:
@@ -184,126 +182,51 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
-def _is_plugin_installed(name: str) -> bool:
-    """Check installed_plugins.json for a plugin by name."""
-    data = _read_json(INSTALLED_PLUGINS_PATH)
-    if not data:
-        return False
-    for key in data.get("plugins", {}):
-        if key.split("@")[0] == name:
-            return True
-    return False
-
-
-def _get_install_path(name: str) -> str | None:
-    """Get the installPath for an installed plugin, or None."""
-    data = _read_json(INSTALLED_PLUGINS_PATH)
-    if not data:
-        return None
-    for key, entries in data.get("plugins", {}).items():
-        if key.split("@")[0] == name and entries:
-            return entries[0].get("installPath")
-    return None
-
-
-def _check_environment(env_reqs: dict) -> bool:
-    """Check if all environment requirements are satisfied."""
-    for key, value in env_reqs.items():
-        values = value if isinstance(value, list) else [value]
-        if key == "os":
-            if not any(platform.system().lower() == v for v in values):
-                return False
-        elif key == "binary":
-            if not any(shutil.which(v) is not None for v in values):
-                return False
-        elif key == "plugin":
-            if not any(_is_plugin_installed(v) for v in values):
-                return False
-        elif key == "file":
-            if not any(Path(os.path.expanduser(v)).exists() for v in values):
-                return False
-    return True
-
-
-def _clone_plugin(name: str, repo: str, version: str = "latest") -> str | None:
-    """Clone a plugin from GitHub into the standard cache path. Returns path or None."""
-    target = PLUGIN_CACHE_DIR / name / version
-    if target.exists():
-        return str(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["git", "clone", "--depth", "1",
-         f"https://github.com/{repo}.git", str(target)],
-        capture_output=True, text=True, timeout=60,
-    )
-    if result.returncode != 0:
-        if target.exists():
-            shutil.rmtree(target)
-        return None
-    return str(target)
-
-
 def resolve_capabilities(capabilities: list[str]) -> list[str]:
-    """Resolve capability names to plugin directory paths.
+    """Resolve capability names to installed plugin directory paths.
 
-    For each capability:
-    1. Find providers in marketplace.json (plugins with capability in 'provides')
-    2. Filter by environment match (os, binary, etc.)
-    3. Prefer already-installed providers
-    4. If no installed provider matches, clone the best one from GitHub
-    5. Return plugin directory paths
+    Walks ~/.claude/plugins/installed_plugins.json. For each capability,
+    returns the path of an installed plugin whose manifest declares the
+    capability in `provides`. Tie-breaker when multiple plugins satisfy
+    the same capability: alphabetical by plugin name.
 
-    Returns:
-        List of plugin directory paths.
+    Capabilities with no installed provider are silently skipped — the
+    agent runs without them. Caller can compare returned paths against
+    requested capabilities to detect this if it matters.
     """
     if not capabilities:
         return []
 
-    marketplace = _read_json(MARKETPLACE_PATH)
-    if not marketplace:
+    installed = _read_json(INSTALLED_PLUGINS_PATH)
+    if not installed:
         return []
 
-    plugins = marketplace.get("plugins", [])
-    resolved_paths = []
+    # Walk every installed plugin once, collect (name, path, provides) tuples.
+    candidates = []
+    for key, entries in installed.get("plugins", {}).items():
+        if not entries:
+            continue
+        name = key.split("@")[0]
+        path = entries[0].get("installPath")
+        if not path or not Path(path).exists():
+            continue
+        manifest = _read_json(Path(path) / ".claude-plugin" / "plugin.json")
+        provides = (manifest or {}).get("provides") or []
+        if provides:
+            candidates.append((name, path, set(provides)))
 
+    candidates.sort(key=lambda c: c[0])
+
+    resolved = []
+    seen = set()
     for cap in capabilities:
-        providers = [p for p in plugins if cap in p.get("provides", [])]
-        if not providers:
-            continue
+        for name, path, provides in candidates:
+            if cap in provides and path not in seen:
+                resolved.append(path)
+                seen.add(path)
+                break
 
-        # Filter by environment match, track install status
-        candidates = []
-        for p in providers:
-            if not _check_environment(p.get("environment", {})):
-                continue
-            candidates.append({
-                "name": p["name"],
-                "source": p.get("source", {}),
-                "version": p.get("version", "latest"),
-                "installed_path": _get_install_path(p["name"]),
-            })
-
-        if not candidates:
-            continue
-
-        # Prefer installed providers
-        candidates.sort(key=lambda c: c["installed_path"] is None)
-        best = candidates[0]
-
-        if best["installed_path"]:
-            path = best["installed_path"]
-        else:
-            repo = best["source"].get("repo", "")
-            if not repo:
-                continue
-            path = _clone_plugin(best["name"], repo, best["version"])
-            if not path:
-                continue
-
-        if path not in resolved_paths:
-            resolved_paths.append(path)
-
-    return resolved_paths
+    return resolved
 
 
 def cleanup_project_mcps(task_id: str) -> None:
@@ -386,8 +309,12 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     # Build model flag
     model_flag = f" --model {model}" if model else ""
 
-    # Build dev channels flag — session-bridge is the only channel
-    all_channels = ["server:session-bridge"]
+    # Build dev channels flag — session-bridge is the only channel.
+    # Loaded as plugin:session-bridge@softwaresoftware-plugins (marketplace
+    # form) so it auto-resolves via /softwaresoftware:install instead of
+    # requiring a hand-edited user MCP entry. The dangerously-load flag is
+    # still needed to bypass the channel allowlist for inbound notifications.
+    all_channels = ["plugin:session-bridge@softwaresoftware-plugins"]
     for ch in (channels or []):
         if ch not in all_channels:
             all_channels.append(ch)
@@ -551,8 +478,9 @@ def write_service_script(
     # Build model flag
     model_flag = f" --model {model}" if model else ""
 
-    # Build dev channels — session-bridge is the only channel
-    all_channels = ["server:session-bridge"]
+    # Build dev channels — session-bridge loaded via marketplace plugin form.
+    # See spawn_task() for the why behind plugin: vs server: choice.
+    all_channels = ["plugin:session-bridge@softwaresoftware-plugins"]
     for ch in (channels or []):
         if ch not in all_channels:
             all_channels.append(ch)
@@ -747,3 +675,96 @@ def is_service_active(task_id: str) -> bool:
         text=True,
     )
     return result.stdout.strip() == "active"
+
+
+# ---------------------------------------------------------------------------
+# Cross-host spawn forwarding
+# ---------------------------------------------------------------------------
+
+
+def _list_mesh_hosts() -> list[dict]:
+    """GET /hosts from the local session-bridge daemon. Returns [] on failure."""
+    req = urllib.request.Request(f"{SESSION_BRIDGE_URL}/hosts", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def lookup_peer_url(host: str) -> str | None:
+    """Resolve a mesh hostname to the URL of its session-bridge daemon.
+
+    Self-host always returns the loopback URL — there is no benefit to
+    routing through the tailnet IP for local calls. Unknown hosts and
+    unreachable session-bridge return None so callers can fail clearly.
+    """
+    hosts = _list_mesh_hosts()
+    for h in hosts:
+        if h.get("host") == host:
+            if h.get("self"):
+                return SESSION_BRIDGE_URL
+            ip = h.get("ip")
+            port = h.get("port") or 8910
+            if not ip:
+                return None
+            return f"http://{ip}:{port}"
+    return None
+
+
+def is_self_host(host: str) -> bool:
+    """Return True if `host` is the local daemon's canonical hostname."""
+    for h in _list_mesh_hosts():
+        if h.get("host") == host:
+            return bool(h.get("self"))
+    return False
+
+
+def spawn_remote(task: dict) -> dict:
+    """Forward a spawn to the peer named in `task['host']` via /spawn.
+
+    The peer's session-bridge daemon does the tmux + claude work and
+    waits for registration; we just pass through the result. The agent
+    becomes mesh-addressable as `<task_id>.taskpilot.<host>` once the
+    peer reports back.
+
+    Pre-PR-4-on-peer ports of session-bridge will return 404 here; the
+    error surfaces to the caller as a clear `spawned: false`.
+    """
+    if task.get("kind") == "service":
+        return {"spawned": False, "error": "kind=service not supported for remote spawn yet (no remote systemd install)"}
+
+    host = task.get("host")
+    if not host:
+        return {"spawned": False, "error": "no host set on task"}
+
+    url = lookup_peer_url(host)
+    if not url:
+        return {"spawned": False, "error": f"host '{host}' is not in the mesh (peers.json or session-bridge unreachable)"}
+
+    payload = {
+        "name": task["task_id"],
+        "namespace": "taskpilot",
+        "labels": ["kind:task"],
+        "model": task.get("model"),
+        "initial_message": task.get("description"),
+    }
+    body = json.dumps({k: v for k, v in payload.items() if v is not None}).encode()
+    req = urllib.request.Request(
+        f"{url}/spawn",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("detail", str(e))
+        except (json.JSONDecodeError, ValueError):
+            detail = str(e)
+        return {"spawned": False, "error": f"peer {host} returned {e.code}: {detail}"}
+    except urllib.error.URLError as e:
+        return {"spawned": False, "error": f"peer {host} unreachable: {e.reason}"}
