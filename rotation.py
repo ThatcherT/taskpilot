@@ -4,34 +4,29 @@
 Called after Claude exits in the tmux while-loop.
 Exit 0 = respawn (continue). Exit 1 = stop (break).
 
+The Stop hook (hooks/on-stop.py) handles the common path: when the agent
+declares completion mid-session, the hook marks the DB completed and kills
+tmux. By the time we run, the DB status check below is enough to break
+the loop.
+
+This script remains as a safety net for crash paths where the hook didn't
+get a chance to fire — Claude exited before completing a turn (segfault,
+OOM, /exit). In that case we re-classify the most recent recorded turn.
+
 Decision sources, in priority order:
-  1. DB status — killed/paused tasks never respawn.
+  1. DB status — killed/paused/completed tasks never respawn.
   2. state.json (`phase` written by the agent itself) — explicit completion.
-  3. state/agent.json `last_stop.last_assistant_message` — implicit completion
-     detected from the agent's final turn (Stop hook).
+  3. state/agent.json `last_stop` — classifier says resolved.
   4. Default — respawn.
 """
 
 import json
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+import classifier
 import store
-
-# Phrases an agent uses when it's wrapping up. Conservative list — false
-# positives here cause premature task completion. We require one of these
-# to appear in the final ~400 chars of the last assistant message.
-COMPLETION_PATTERNS = [
-    r"\btask (?:is )?(?:complete|completed|done|resolved|finished)\b",
-    r"\b(?:all|everything) done\b",
-    r"\bnothing (?:left|else) to do\b",
-    r"\bfinished (?:the )?(?:task|work|job)\b",
-    r"\bwrapping up\b",
-    r"\bmarking (?:this |the )?(?:task )?complete\b",
-]
-_COMPLETION_RE = re.compile("|".join(COMPLETION_PATTERNS), re.IGNORECASE)
 
 
 def _read_json(path: Path) -> dict | None:
@@ -53,17 +48,13 @@ def _explicit_completion(task_id: str) -> bool:
 
 
 def _implicit_completion(task_id: str) -> bool:
-    """Stop hook captured a completion-shaped final message."""
+    """Classifier on the last recorded Stop says resolved."""
     agent = _read_json(Path.home() / ".taskpilot" / task_id / "state" / "agent.json")
     if not agent:
         return False
     last_stop = agent.get("last_stop") or {}
     msg = last_stop.get("last_assistant_message") or ""
-    if not msg:
-        return False
-    # Match against the tail — agents tend to declare completion at the end.
-    tail = msg[-400:]
-    return bool(_COMPLETION_RE.search(tail))
+    return classifier.classify(msg) == "resolved"
 
 
 def _mark_completed(task_id: str) -> None:

@@ -130,41 +130,66 @@ class TestWriteTaskConfig:
 
 class TestResolveCapabilities:
     @pytest.fixture()
-    def fake_marketplace(self, tmp_path):
-        """Set up fake marketplace and installed_plugins files, return tmp_path."""
-        marketplace = tmp_path / "marketplace.json"
-        marketplace.write_text(json.dumps({"plugins": [
-            {"name": "memory-file", "provides": ["memory"],
-             "source": {"source": "github", "repo": "softwaresoftware-dev/memory-file"},
-             "version": "0.1.0"},
-        ]}))
-        installed = tmp_path / "installed.json"
-        installed.write_text(json.dumps({"version": 2, "plugins": {}}))
-        with patch.object(spawner, 'MARKETPLACE_PATH', marketplace), \
-             patch.object(spawner, 'INSTALLED_PLUGINS_PATH', installed), \
-             patch.object(spawner, 'PLUGIN_CACHE_DIR', tmp_path / "cache"):
-            yield tmp_path
+    def installed(self, tmp_path):
+        """Helper that builds a fake installed_plugins.json + manifests on disk.
 
-    def test_resolves_installed_provider(self, fake_marketplace):
-        """Returns installPath when provider is already installed."""
-        installed = fake_marketplace / "installed.json"
-        installed.write_text(json.dumps({"version": 2, "plugins": {
-            "memory-file@softwaresoftware-plugins": [{"installPath": "/fake/memory-file", "version": "0.1.0"}],
-        }}))
-        assert spawner.resolve_capabilities(["memory"]) == ["/fake/memory-file"]
+        Returns a callable that writes the registry. Each call accepts a list
+        of (plugin_key, provides_list) and creates a real dir per plugin so
+        the resolver's existence check passes.
+        """
+        installed_path = tmp_path / "installed.json"
 
-    def test_clones_when_not_installed(self, fake_marketplace):
-        """Clones from GitHub when provider is not installed."""
-        with patch("spawner.subprocess.run") as mock_run:
-            mock_run.return_value = type("R", (), {"returncode": 0})()
-            result = spawner.resolve_capabilities(["memory"])
-            args = mock_run.call_args[0][0]
-            assert args[:2] == ["git", "clone"]
-            assert "softwaresoftware-dev/memory-file" in args[4]
-            assert result == [str(fake_marketplace / "cache" / "memory-file" / "0.1.0")]
+        def write(entries):
+            registry = {"version": 2, "plugins": {}}
+            for key, provides in entries:
+                name = key.split("@")[0]
+                plugin_dir = tmp_path / name
+                (plugin_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+                (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+                    json.dumps({"name": name, "provides": provides})
+                )
+                registry["plugins"][key] = [{"installPath": str(plugin_dir)}]
+            installed_path.write_text(json.dumps(registry))
+            return tmp_path
 
-    def test_clone_failure_skips(self, fake_marketplace):
-        """Skips capability gracefully when clone fails."""
-        with patch("spawner.subprocess.run") as mock_run:
-            mock_run.return_value = type("R", (), {"returncode": 1})()
+        with patch.object(spawner, "INSTALLED_PLUGINS_PATH", installed_path):
+            yield write
+
+    def test_resolves_installed_provider(self, installed):
+        """Returns installPath when provider is installed."""
+        root = installed([("memory-file@softwaresoftware-plugins", ["memory"])])
+        assert spawner.resolve_capabilities(["memory"]) == [str(root / "memory-file")]
+
+    def test_unsatisfied_capability_returns_nothing(self, installed):
+        """Capability with no installed provider is silently skipped."""
+        installed([("memory-file@softwaresoftware-plugins", ["memory"])])
+        assert spawner.resolve_capabilities(["notification"]) == []
+
+    def test_no_registry_returns_empty(self, tmp_path):
+        """Missing installed_plugins.json returns nothing, no exception."""
+        with patch.object(spawner, "INSTALLED_PLUGINS_PATH", tmp_path / "missing.json"):
             assert spawner.resolve_capabilities(["memory"]) == []
+
+    def test_alphabetical_tiebreak(self, installed):
+        """When multiple plugins provide the same capability, alphabetical wins."""
+        root = installed([
+            ("notify-slack@softwaresoftware-plugins", ["notification"]),
+            ("notify-linux@softwaresoftware-plugins", ["notification"]),
+        ])
+        # notify-linux sorts before notify-slack
+        assert spawner.resolve_capabilities(["notification"]) == [str(root / "notify-linux")]
+
+    def test_dedupes_one_plugin_many_capabilities(self, installed):
+        """A plugin satisfying multiple requested capabilities appears once."""
+        root = installed([
+            ("multi@softwaresoftware-plugins", ["memory", "notification"]),
+        ])
+        assert spawner.resolve_capabilities(["memory", "notification"]) == [str(root / "multi")]
+
+    def test_skips_missing_install_path(self, installed):
+        """An installed_plugins entry pointing at a deleted dir is silently skipped."""
+        root = installed([("memory-file@softwaresoftware-plugins", ["memory"])])
+        # Nuke the on-disk dir; registry still references it.
+        import shutil as _shutil
+        _shutil.rmtree(root / "memory-file")
+        assert spawner.resolve_capabilities(["memory"]) == []
