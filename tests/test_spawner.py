@@ -64,18 +64,34 @@ class TestBuildClaudeMd:
         assert "## Boundaries" in md
         assert "- don't spend money" in md
 
+        # Capability sections describe intent — tool names live in the MCP
+        # servers' own descriptions, not in CLAUDE.md.
         assert "## Memory" in md
-        assert "store_memory" in md
+        assert "across sessions" in md
+        assert "Use an available skill or tool" in md
 
         assert "## Scheduling" in md
-        assert "schedule_task" in md
+        assert "recurring workflows" in md
 
         assert "## Human Approval" in md
-        assert "request_approval" in md
+        assert "request human approval" in md
+
+        # And critically — no hardcoded tool names that would silently drift
+        # if a capability provider changes its API.
+        assert "store_memory" not in md
+        assert "schedule_task(" not in md  # the MCP tool name with args
+        assert "request_approval" not in md
 
     def test_memory_only_when_declared(self):
         md = spawner._build_claude_md("Test", "desc", {"capabilities": []})
         assert "## Memory" not in md
+
+    def test_capabilities_gate_their_sections(self):
+        """Each capability section appears only when declared."""
+        md = spawner._build_claude_md("Test", "desc", {"capabilities": []})
+        assert "## Memory" not in md
+        assert "## Scheduling" not in md
+        assert "## Human Approval" not in md
 
     def test_always_has_core_sections(self):
         md = spawner._build_claude_md("Test", "desc", {})
@@ -83,7 +99,6 @@ class TestBuildClaudeMd:
         assert "## How to Escalate to Human" in md
         assert "## State File" in md
         assert "## Channel Communication" in md
-        assert "## Scheduling" in md  # built-in, always present
         assert "## On Startup" in md
 
 
@@ -193,3 +208,39 @@ class TestResolveCapabilities:
         import shutil as _shutil
         _shutil.rmtree(root / "memory-file")
         assert spawner.resolve_capabilities(["memory"]) == []
+
+    def test_delegates_to_softwaresoftware_when_available(self, tmp_path):
+        """When softwaresoftware's resolver+registry are importable, resolve_capabilities
+        delegates to find_satisfier instead of using the alphabetical fallback."""
+        from unittest.mock import MagicMock
+        sw_resolver = MagicMock()
+        sw_registry = MagicMock()
+        # Simulate a 'memory' capability satisfied by an installed plugin.
+        sw_resolver.find_satisfier.return_value = {"type": "plugin", "name": "memory-file"}
+        sw_registry.get_plugin_install_path.return_value = tmp_path / "memory-file"
+
+        with patch.object(spawner, "_import_softwaresoftware",
+                          return_value=(sw_resolver, sw_registry)):
+            result = spawner.resolve_capabilities(["memory"])
+
+        assert result == [str(tmp_path / "memory-file")]
+        sw_resolver.find_satisfier.assert_called_once_with("memory")
+
+    def test_skips_mcp_and_host_satisfiers(self, tmp_path):
+        """type=mcp / type=host / type=none don't add a --plugin-dir."""
+        from unittest.mock import MagicMock
+        sw_resolver = MagicMock()
+        sw_registry = MagicMock()
+        sw_resolver.find_satisfier.side_effect = [
+            {"type": "mcp", "name": "slack-mcp"},
+            {"type": "host", "host": "pixel-7-pro", "self": False},
+            {"type": "none"},
+        ]
+
+        with patch.object(spawner, "_import_softwaresoftware",
+                          return_value=(sw_resolver, sw_registry)):
+            result = spawner.resolve_capabilities(["notification", "send-sms", "unknown"])
+
+        assert result == []
+        # Registry shouldn't have been queried — no plugin-type satisfiers.
+        sw_registry.get_plugin_install_path.assert_not_called()

@@ -162,13 +162,11 @@ class TestTaskCreation:
         assert "## Boundaries" in md
         assert "- don't spend money without approval" in md
 
-        # Capability sections
+        # Capability sections — present, intent-described, no tool names.
         assert "## Memory" in md
-        assert "store_memory" in md
         assert "## Scheduling" in md
-        assert "schedule_task" in md
         assert "## Human Approval" in md
-        assert "request_approval" in md
+        assert "Use an available skill or tool" in md
 
         # Always-present sections
         assert "## Autonomy Rules" in md

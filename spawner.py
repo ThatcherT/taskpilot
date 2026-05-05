@@ -113,8 +113,7 @@ def _build_claude_md(name: str, description: str, brief: dict) -> str:
 When you genuinely need human input:
 1. Reply on the channel with your question clearly stated
 2. Continue other pending work while waiting
-3. The human's reply arrives as a channel message — resume the blocked task when it arrives
-4. If no response after a long time, log the blocked decision in state.json and move on""")
+3. The human's reply arrives as a channel message — resume the blocked task when it arrives""")
 
     # State File (always)
     sections.append("""## State File
@@ -128,42 +127,31 @@ When you genuinely need human input:
 Messages arrive as <channel> notifications.
 Use the `reply` tool to respond. Always include useful context in replies.""")
 
-    # Memory instructions (if memory capability declared)
+    # Capability sections — describe intent only. Tool names live in the
+    # MCP servers' own descriptions, which Claude Code auto-loads into the
+    # agent's context. Listing them here would duplicate (and silently
+    # drift from) the source of truth in each capability provider.
     capabilities = brief.get("capabilities", [])
+
     if "memory" in capabilities:
         sections.append("""## Memory
-You have persistent memory tools available. Use them to store institutional knowledge
-that should survive across sessions — insights, experiment results, market data, learned
-patterns. This is NOT crash recovery (that's state.json). Memory is for accumulated
-knowledge that makes you smarter over time.
+Persistent memory is available for institutional knowledge that should survive
+across sessions — insights, experiment results, market data, learned patterns.
+This is NOT crash recovery (that's state.json). Store a memory after every
+significant discovery or decision. Use an available skill or tool.""")
 
-- `store_memory(key, content)` — save knowledge by topic
-- `recall_memory(key)` — retrieve by key
-- `search_memory(query)` — find relevant memories
-- `list_memories()` — see what you know
-
-Store a memory after every significant discovery or decision.""")
-
-    # Human-approval instructions (if capability declared)
     if "human-approval" in capabilities:
         sections.append("""## Human Approval
-You have human-approval tools available. Before taking any high-stakes or irreversible
-action (posting publicly, spending money, sending external communications), use
-`request_approval(action, context)` and wait for confirmation before proceeding.
+Before any high-stakes or irreversible action — posting publicly, spending
+money, sending external communications — request human approval and wait for
+confirmation. If approval times out, skip the action and log it to state.json.
+Use an available skill or tool.""")
 
-Check approval status with `check_approval(request_id)`. If approval times out,
-skip the action and log it to state.json.""")
-
-    # Scheduling instructions (always available — built into taskpilot)
-    sections.append("""## Scheduling
-You have scheduling tools available. Use them to set up recurring workflows that
-should run on a cadence — daily research, periodic checks, content schedules.
-
-- `schedule_task(name, plugin, skill, interval)` — create a recurring event
-- `list_scheduled_tasks()` — see active schedules
-- `remove_scheduled_task(name)` — cancel a schedule
-
-Scheduled events arrive as channel messages. Process them when they arrive.""")
+    if "scheduling" in capabilities:
+        sections.append("""## Scheduling
+Scheduling is available for recurring workflows on a cadence — daily research,
+periodic checks, content schedules. Scheduled events arrive as channel
+messages; process them when they arrive. Use an available skill or tool.""")
 
     # On Startup (always)
     sections.append("""## On Startup
@@ -182,26 +170,88 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
+def _import_softwaresoftware():
+    """Locate the installed softwaresoftware plugin and import its
+    resolver + registry modules.
+
+    Returns (resolver_module, registry_module), or (None, None) if
+    softwaresoftware isn't installed or its dependencies can't load.
+    Side effect: appends softwaresoftware's install path to sys.path
+    (idempotent — only once per process).
+    """
+    installed = _read_json(INSTALLED_PLUGINS_PATH)
+    if not installed:
+        return None, None
+    entries = installed.get("plugins", {}).get("softwaresoftware@softwaresoftware-plugins") or []
+    if not entries:
+        return None, None
+    sw_path = entries[0].get("installPath", "")
+    if not sw_path or not Path(sw_path).exists():
+        return None, None
+
+    import sys
+    if sw_path not in sys.path:
+        sys.path.append(sw_path)
+    try:
+        import resolver as sw_resolver
+        import registry as sw_registry
+    except ImportError:
+        return None, None
+    # find_satisfier was added in softwaresoftware 1.4.0. Older installs lack
+    # it; we fall back to the in-house alphabetical resolver in that case so
+    # taskpilot keeps working until the user reinstalls softwaresoftware.
+    if not hasattr(sw_resolver, "find_satisfier"):
+        return None, None
+    return sw_resolver, sw_registry
+
+
 def resolve_capabilities(capabilities: list[str]) -> list[str]:
     """Resolve capability names to installed plugin directory paths.
 
-    Walks ~/.claude/plugins/installed_plugins.json. For each capability,
-    returns the path of an installed plugin whose manifest declares the
-    capability in `provides`. Tie-breaker when multiple plugins satisfy
-    the same capability: alphabetical by plugin name.
+    Delegates to softwaresoftware's `resolver.find_satisfier` so we get
+    the same environment-aware provider selection that the install-time
+    resolver uses (matches binary/os/mcp probes per provider). For each
+    capability:
 
-    Capabilities with no installed provider are silently skipped — the
-    agent runs without them. Caller can compare returned paths against
-    requested capabilities to detect this if it matters.
+      * type=plugin → returns the plugin's installed path (added to --plugin-dir).
+      * type=mcp    → satisfied by an already-loaded MCP server; nothing to add.
+      * type=host   → cross-host satisfaction; out of scope for local spawn.
+      * type=none   → no satisfier; silently skipped.
+
+    Falls back to a simple alphabetical-first walk over installed_plugins.json
+    if softwaresoftware isn't installed (e.g. in tests or pre-install).
     """
     if not capabilities:
         return []
 
+    sw_resolver, sw_registry = _import_softwaresoftware()
+    if sw_resolver and sw_registry:
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for cap in capabilities:
+            sat = sw_resolver.find_satisfier(cap)
+            if sat.get("type") != "plugin":
+                continue
+            path = sw_registry.get_plugin_install_path(sat["name"])
+            if not path:
+                continue
+            p = str(path)
+            if p not in seen:
+                resolved.append(p)
+                seen.add(p)
+        return resolved
+
+    return _resolve_capabilities_fallback(capabilities)
+
+
+def _resolve_capabilities_fallback(capabilities: list[str]) -> list[str]:
+    """Pre-softwaresoftware fallback: walk installed_plugins.json directly,
+    pick the first alphabetical provider for each capability. Used only when
+    softwaresoftware isn't reachable as a Python module."""
     installed = _read_json(INSTALLED_PLUGINS_PATH)
     if not installed:
         return []
 
-    # Walk every installed plugin once, collect (name, path, provides) tuples.
     candidates = []
     for key, entries in installed.get("plugins", {}).items():
         if not entries:
