@@ -1,8 +1,6 @@
 """Classify an agent's final assistant message into an action bucket.
 
-Used by:
-- hooks/on-stop.py — to act in real time when the agent finishes a turn
-- rotation.py — as a safety net when the agent exits before the hook can act
+Used by hooks/on-stop.py to act in real time when the agent finishes a turn.
 
 Three buckets:
   resolved    — the agent declared the task done.

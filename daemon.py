@@ -4,18 +4,12 @@
 Long-lived process that owns the spawn/kill/respawn lifecycle for tasks.
 The MCP server (server.py) is a thin client over this daemon's HTTP API.
 
-Phases:
-  0. Scaffold (this file). Endpoints exist; spawn/kill/message return 501
-     until phase 1 wires them.
-  1. Route new spawns through daemon (spawner.spawn_tmux delegates here).
-  2. Migrate existing kind=service tasks off per-task systemd units.
-  3. Cleanup — drop start.sh, rotation.py, liveness.py.
-
-Why a daemon at all: see the bigger refactor note in CLAUDE.md / vault. Short
-version: a Claude-session-scoped MCP can't outlive its parent, so per-task
-systemd units became the de-facto supervisors. Template drift, liveness
-fictions, and split state are the price. This daemon collapses those concerns
-into one process.
+The daemon installs as a single systemd user unit (`daemon.py --install`)
+and supervises every running task via a periodic reconciler that walks the
+task DB, checks tmux liveness, and respawns dead services or marks dead
+one-shots as crashed. Spawn / kill / message all flow through the same
+HTTP endpoints regardless of task kind — the kind difference is reconciler
+treatment, not spawn path.
 """
 
 import asyncio
@@ -60,18 +54,17 @@ class MessageRequest(BaseModel):
 
 # --- Reconciler ---
 #
-# Phase 2: every RECONCILE_INTERVAL_S seconds the daemon walks tasks with
+# Every RECONCILE_INTERVAL_S seconds the daemon walks tasks with
 # status='running' and reconciles DB ↔ reality:
 #   - tmux alive → stamp last_seen_at (heartbeat)
 #   - tmux dead, kind=service → respawn (the supervisor part)
 #   - tmux dead, kind=task    → mark crashed (one-shot semantics)
 #
-# This single tick subsumes three concerns previously split across files:
-#   • boot-time spawn-up of services (replaces per-task systemd units that
-#     ran start.sh on boot)
-#   • crash recovery (replaces the bash while-loop that respawned claude
-#     when it exited inside its tmux session)
-#   • liveness reconciliation (replaces the standalone liveness.py timer)
+# This single tick covers boot-time spawn-up (first tick after the daemon
+# starts brings services back), crash recovery (next tick after tmux dies
+# reaps and respawns), and liveness reconciliation (DB status reflects
+# what's actually running). Killed and completed tasks are ignored — the
+# filter is status='running' only.
 
 
 def _spawn_body(task: dict) -> None:
@@ -204,8 +197,6 @@ def _enrich(task: dict) -> dict:
     tid = task["task_id"]
     task["tmux_alive"] = spawner.is_tmux_alive(tid)
     task["channel_healthy"] = spawner.channel_healthy(tid)
-    if task.get("kind") == "service":
-        task["systemd_active"] = spawner.is_service_active(tid)
     return task
 
 
@@ -263,11 +254,9 @@ def get_log(task_id: str, lines: int = 50) -> dict:
 
 # --- Write endpoints ---
 #
-# As of phase 2, /spawn and /kill handle both kind=task and kind=service.
-# The difference is reconciler treatment, not spawn-path: services auto-respawn
-# on tmux death, tasks get marked crashed. Spawn itself is the same call into
-# spawner.spawn_tmux for both — no per-task systemd, no start.sh, no while-loop
-# (the daemon's reconciler is the supervisor now).
+# /spawn and /kill handle both kind=task and kind=service. The kind difference
+# is reconciler treatment, not spawn path: services auto-respawn on tmux
+# death, tasks get marked crashed. Both go through spawner.spawn_tmux.
 
 
 @app.post("/tasks/{task_id}/spawn")
@@ -391,6 +380,11 @@ Type=simple
 ExecStart={py} {daemon_py}
 Restart=on-failure
 RestartSec=5
+# Only kill the daemon's main process on stop, not its descendants. The
+# daemon spawns detached tmux sessions for each task; the default
+# control-group KillMode would tear those down on every daemon restart,
+# orphaning every running agent.
+KillMode=process
 StandardOutput=journal
 StandardError=journal
 

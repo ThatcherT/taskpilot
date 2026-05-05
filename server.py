@@ -238,8 +238,6 @@ def list_tasks(status: str | None = None) -> list[dict]:
     for t in tasks:
         t["tmux_alive"] = spawner.is_tmux_alive(t["task_id"])
         t["channel_healthy"] = spawner.channel_healthy(t["task_id"])
-        if t.get("kind") == "service":
-            t["systemd_active"] = spawner.is_service_active(t["task_id"])
     return tasks
 
 
@@ -266,8 +264,6 @@ def get_task(task_id: str) -> dict:
 
     task["tmux_alive"] = spawner.is_tmux_alive(task_id)
     task["channel_healthy"] = spawner.channel_healthy(task_id)
-    if task.get("kind") == "service":
-        task["systemd_active"] = spawner.is_service_active(task_id)
 
     state_file = spawner.task_dir(task_id) / "state.json"
     if state_file.exists():
@@ -341,7 +337,6 @@ def kill_task(task_id: str) -> dict:
         conn.close()
         return {"error": f"Task '{task_id}' not found"}
 
-    kind = task.get("kind", "task")
     conn.close()
 
     # Both kinds route through the daemon when available.
@@ -351,27 +346,16 @@ def kill_task(task_id: str) -> dict:
 
     # Daemon down — direct path.
     conn = store.get_db()
-
-    # If the task was created under the legacy per-task systemd model, tear
-    # the unit down too. Tasks created post-daemon have no unit and this is
-    # a no-op.
-    service_removed = False
-    if kind == "service":
-        service_removed = spawner.uninstall_service(task_id)
-
     tmux_killed = spawner.kill_tmux(task_id)
     spawner.cleanup_project_mcps(task_id)
     store.update_status(conn, task_id, "killed")
     conn.close()
 
-    result = {
+    return {
         "task_id": task_id,
         "status": "killed",
         "tmux_killed": tmux_killed,
     }
-    if kind == "service":
-        result["service_removed"] = service_removed
-    return result
 
 
 @mcp.tool()
