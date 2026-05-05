@@ -12,18 +12,17 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-import store
+import scheduler
 import spawner
+import store
 
 mcp = FastMCP("taskpilot")
 
 TASKPILOT_DIR = Path.home() / ".taskpilot"
-SCHEDULES_FILE = TASKPILOT_DIR / "schedules.json"
 DAEMON_URL = os.environ.get("TASKPILOT_DAEMON_URL", "http://127.0.0.1:8912")
 
 
@@ -255,13 +254,19 @@ def list_tasks(status: str | None = None) -> list[dict]:
         status: Filter by status (pending/running/paused/completed/killed). None for all.
 
     Returns:
-        List of task records.
+        List of task records with live tmux/channel/systemd health.
     """
+    qs = f"?status={status}" if status else ""
+    daemon_result = _daemon_call("GET", f"/tasks{qs}")
+    if isinstance(daemon_result, list):
+        return daemon_result
+    if isinstance(daemon_result, dict) and "error" in daemon_result:
+        return daemon_result  # daemon up but errored — surface
+
+    # Daemon down — direct fallback.
     conn = store.get_db()
     tasks = store.list_tasks(conn, status)
     conn.close()
-
-    # Enrich with live status
     for t in tasks:
         t["tmux_alive"] = spawner.is_tmux_alive(t["task_id"])
         t["channel_healthy"] = spawner.channel_healthy(t["task_id"])
@@ -280,6 +285,11 @@ def get_task(task_id: str) -> dict:
     Returns:
         Task record with state.json contents if available.
     """
+    daemon_result = _daemon_call("GET", f"/tasks/{task_id}")
+    if daemon_result is not None:
+        return daemon_result
+
+    # Daemon down — direct fallback.
     conn = store.get_db()
     task = store.get_task(conn, task_id)
     conn.close()
@@ -291,7 +301,6 @@ def get_task(task_id: str) -> dict:
     if task.get("kind") == "service":
         task["systemd_active"] = spawner.is_service_active(task_id)
 
-    # Read state.json if it exists
     state_file = spawner.task_dir(task_id) / "state.json"
     if state_file.exists():
         try:
@@ -413,6 +422,11 @@ def get_task_log(task_id: str, lines: int = 50) -> dict:
     Returns:
         Captured pane output.
     """
+    daemon_result = _daemon_call("GET", f"/tasks/{task_id}/log?lines={lines}")
+    if daemon_result is not None:
+        return daemon_result
+
+    # Daemon down — direct fallback.
     session = spawner.tmux_session_name(task_id)
     try:
         result = subprocess.run(
@@ -501,84 +515,14 @@ def respawn_task(task_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Scheduling — cron-based recurring task events (merged from scheduler-cron)
+# Scheduling — thin MCP wrappers; logic lives in scheduler.py
 # ---------------------------------------------------------------------------
 
 
-def _read_schedules() -> dict:
-    if not SCHEDULES_FILE.exists():
-        return {}
-    try:
-        return json.loads(SCHEDULES_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _write_schedules(schedules: dict) -> None:
-    SCHEDULES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SCHEDULES_FILE.write_text(json.dumps(schedules, indent=2))
-
-
-def _get_current_crontab() -> str:
-    try:
-        result = subprocess.run(
-            ["crontab", "-l"], capture_output=True, text=True, timeout=5,
-        )
-        return result.stdout if result.returncode == 0 else ""
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return ""
-
-
-def _set_crontab(content: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["crontab", "-"], input=content, capture_output=True, text=True, timeout=5,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-
-
-def _schedule_tag(task_id: str, name: str) -> str:
-    return f"# taskpilot-schedule:{task_id}:{name}"
-
-
-def _human_to_cron(interval: str) -> str | None:
-    """Convert human-readable intervals to cron expressions.
-
-    Supports cron expressions (5 fields), "every Xm/Xh/Xd", "daily", "hourly", "weekly".
-    """
-    interval = interval.strip()
-    parts = interval.split()
-    if len(parts) == 5:
-        return interval
-
-    lower = interval.lower()
-    if lower == "daily":
-        return "0 9 * * *"
-    if lower == "hourly":
-        return "0 * * * *"
-    if lower == "weekly":
-        return "0 9 * * 1"
-
-    if lower.startswith("every "):
-        spec = lower[6:].strip()
-        if spec.endswith("m"):
-            try:
-                return f"*/{int(spec[:-1])} * * * *"
-            except ValueError:
-                pass
-        elif spec.endswith("h"):
-            try:
-                return f"0 */{int(spec[:-1])} * * *"
-            except ValueError:
-                pass
-        elif spec.endswith("d"):
-            try:
-                return f"0 9 */{int(spec[:-1])} * *"
-            except ValueError:
-                pass
-    return None
+def _current_task_id() -> str | None:
+    """Resolve the calling agent's task id from env. None if unset."""
+    tid = os.environ.get("TASKPILOT_TASK_ID", "").strip()
+    return tid or None
 
 
 @mcp.tool()
@@ -605,71 +549,19 @@ def schedule_task(
     Returns:
         Confirmation with schedule details.
     """
-    cron_expr = _human_to_cron(interval)
-    if not cron_expr:
-        return {"error": f"Invalid interval: '{interval}'. Use cron (5 fields), 'every Xm/Xh/Xd', 'daily', 'hourly', or 'weekly'."}
-
-    task_id = os.environ.get("TASKPILOT_TASK_ID", "unknown")
-    if task_id == "unknown":
+    task_id = _current_task_id()
+    if not task_id:
         return {"error": "Cannot determine task id. Is TASKPILOT_TASK_ID set?"}
-
-    tag = _schedule_tag(task_id, name)
-    message = f"[scheduled:{name}] Time to run {skill} (plugin: {plugin})"
-    payload = json.dumps({"text": message, "from_session": "cron"})
-    target_url = f"{spawner.SESSION_BRIDGE_URL}/sessions/{task_id}/message"
-    # Crontab-safe: single-quote the JSON body, escape inner single quotes.
-    cron_line = (
-        f"{cron_expr} curl -s -X POST -H 'Content-Type: application/json' "
-        f"-d {json.dumps(payload)} {target_url} > /dev/null 2>&1 {tag}"
-    )
-
-    # Update crontab
-    current = _get_current_crontab()
-    lines = [l for l in current.splitlines() if tag not in l]
-    if enabled:
-        lines.append(cron_line)
-    new_crontab = "\n".join(lines)
-    if new_crontab and not new_crontab.endswith("\n"):
-        new_crontab += "\n"
-    if not _set_crontab(new_crontab):
-        return {"error": "Failed to update crontab"}
-
-    # Update schedules registry
-    schedules = _read_schedules()
-    schedules[f"{task_id}:{name}"] = {
-        "name": name,
-        "task_id": task_id,
-        "plugin": plugin,
-        "skill": skill,
-        "interval": interval,
-        "cron_expr": cron_expr,
-        "target_url": target_url,
-        "enabled": enabled,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _write_schedules(schedules)
-
-    return {
-        "scheduled": True,
-        "name": name,
-        "cron_expr": cron_expr,
-        "target_url": target_url,
-        "message": message,
-        "enabled": enabled,
-    }
+    return scheduler.schedule(task_id, name, plugin, skill, interval, enabled)
 
 
 @mcp.tool()
 def list_scheduled_tasks() -> dict:
-    """List all scheduled tasks for the current agent.
-
-    Returns:
-        List of active schedules with their details.
-    """
-    task_id = os.environ.get("TASKPILOT_TASK_ID", "unknown")
-    schedules = _read_schedules()
-    task_schedules = [s for s in schedules.values() if s.get("task_id") == task_id]
-    return {"task_id": task_id, "count": len(task_schedules), "schedules": task_schedules}
+    """List all scheduled tasks for the current agent."""
+    task_id = _current_task_id()
+    if not task_id:
+        return {"error": "Cannot determine task id. Is TASKPILOT_TASK_ID set?"}
+    return scheduler.list_for_task(task_id)
 
 
 @mcp.tool()
@@ -682,25 +574,10 @@ def remove_scheduled_task(name: str) -> dict:
     Returns:
         Confirmation of removal.
     """
-    task_id = os.environ.get("TASKPILOT_TASK_ID", "unknown")
-    tag = _schedule_tag(task_id, name)
-
-    # Remove from crontab
-    current = _get_current_crontab()
-    lines = [l for l in current.splitlines() if tag not in l]
-    new_crontab = "\n".join(lines)
-    if new_crontab and not new_crontab.endswith("\n"):
-        new_crontab += "\n"
-    _set_crontab(new_crontab)
-
-    # Remove from schedules registry
-    schedules = _read_schedules()
-    key = f"{task_id}:{name}"
-    removed = key in schedules
-    schedules.pop(key, None)
-    _write_schedules(schedules)
-
-    return {"removed": removed, "name": name, "task_id": task_id}
+    task_id = _current_task_id()
+    if not task_id:
+        return {"error": "Cannot determine task id. Is TASKPILOT_TASK_ID set?"}
+    return scheduler.remove(task_id, name)
 
 
 if __name__ == "__main__":

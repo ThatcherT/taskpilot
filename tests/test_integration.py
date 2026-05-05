@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import store
 import spawner
+import scheduler
 import server as taskpilot_server
 
 # Import capability plugin servers (need separate namespace)
@@ -110,9 +111,9 @@ def integrated_env(tmp_path):
         patch.object(spawner, "TASKPILOT_DIR", tmp_path),
         patch.object(memory_server, "TASKPILOT_DIR", tmp_path),
         patch.object(taskpilot_server, "TASKPILOT_DIR", tmp_path),
-        patch.object(taskpilot_server, "SCHEDULES_FILE", tmp_path / "schedules.json"),
-        patch.object(taskpilot_server, "_get_current_crontab", side_effect=lambda: fake_cron.get()),
-        patch.object(taskpilot_server, "_set_crontab", side_effect=lambda c: fake_cron.set(c) or True),
+        patch.object(scheduler, "SCHEDULES_FILE", tmp_path / "schedules.json"),
+        patch.object(scheduler, "_get_current_crontab", side_effect=lambda: fake_cron.get()),
+        patch.object(scheduler, "_set_crontab", side_effect=lambda c: fake_cron.set(c) or True),
         patch.object(approval_server, "DATA_DIR", tmp_path, create=True),
         patch.object(approval_server, "_post_to_channel", return_value=True, create=True),
     ):

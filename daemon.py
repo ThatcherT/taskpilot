@@ -88,28 +88,46 @@ def health() -> HealthResponse:
     )
 
 
+def _enrich(task: dict) -> dict:
+    """Add live health fields to a task row. Mutates and returns."""
+    tid = task["task_id"]
+    task["tmux_alive"] = spawner.is_tmux_alive(tid)
+    task["channel_healthy"] = spawner.channel_healthy(tid)
+    if task.get("kind") == "service":
+        task["systemd_active"] = spawner.is_service_active(tid)
+    return task
+
+
+def _read_state(task_id: str) -> dict | None:
+    """Read state.json for a task, returning None if absent or malformed."""
+    state_file = spawner.task_dir(task_id) / "state.json"
+    if not state_file.exists():
+        return None
+    try:
+        return json.loads(state_file.read_text())
+    except json.JSONDecodeError:
+        return {"error": "malformed state.json"}
+
+
 @app.get("/tasks")
 def list_tasks(status: str | None = None) -> list[dict]:
-    """List tasks. Optional ?status= filter."""
+    """List tasks with live health. Optional ?status= filter."""
     conn = store.get_db()
     tasks = store.list_tasks(conn, status)
     conn.close()
-    for t in tasks:
-        t["tmux_alive"] = spawner.is_tmux_alive(t["task_id"])
-        t["channel_healthy"] = spawner.channel_healthy(t["task_id"])
-    return tasks
+    return [_enrich(t) for t in tasks]
 
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str) -> dict:
-    """Full task detail."""
+    """Full task detail with live health and state.json."""
     conn = store.get_db()
     task = store.get_task(conn, task_id)
     conn.close()
     if not task:
         raise HTTPException(status_code=404, detail=f"task '{task_id}' not found")
-    task["tmux_alive"] = spawner.is_tmux_alive(task_id)
-    task["channel_healthy"] = spawner.channel_healthy(task_id)
+    _enrich(task)
+    task["state"] = _read_state(task_id)
     return task
 
 
