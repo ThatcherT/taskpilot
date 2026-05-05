@@ -3,10 +3,10 @@
   "description": "Spawn and manage long-running autonomous Claude Code sessions for background tasks",
   "version": "0.6.0",
   "author": {
-    "name": "Thatcher",
-    "url": "https://github.com/ThatcherT"
+    "name": "NOV LLC",
+    "url": "https://github.com/softwaresoftware-dev"
   },
-  "repository": "https://github.com/ThatcherT/taskpilot",
+  "repository": "https://github.com/softwaresoftware-dev/taskpilot",
   "keywords": [
     "agent",
     "autonomous",
