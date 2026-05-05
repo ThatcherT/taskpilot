@@ -174,20 +174,22 @@ def _import_softwaresoftware():
     """Locate the installed softwaresoftware plugin and import its
     resolver + registry modules.
 
-    Returns (resolver_module, registry_module), or (None, None) if
-    softwaresoftware isn't installed or its dependencies can't load.
+    Returns (resolver_module, registry_module).
+    Raises RuntimeError if softwaresoftware (>= 1.4.0) isn't installed or
+    can't be imported. taskpilot has a hard runtime dependency on it for
+    capability resolution.
+
     Side effect: appends softwaresoftware's install path to sys.path
     (idempotent — only once per process).
     """
     installed = _read_json(INSTALLED_PLUGINS_PATH)
-    if not installed:
-        return None, None
-    entries = installed.get("plugins", {}).get("softwaresoftware@softwaresoftware-plugins") or []
-    if not entries:
-        return None, None
-    sw_path = entries[0].get("installPath", "")
+    entries = (installed or {}).get("plugins", {}).get("softwaresoftware@softwaresoftware-plugins") or []
+    sw_path = (entries[0].get("installPath") if entries else "") or ""
     if not sw_path or not Path(sw_path).exists():
-        return None, None
+        raise RuntimeError(
+            "softwaresoftware (>= 1.4.0) is required for capability resolution "
+            "but isn't installed. Run: /softwaresoftware:install softwaresoftware"
+        )
 
     import sys
     if sw_path not in sys.path:
@@ -195,22 +197,15 @@ def _import_softwaresoftware():
     try:
         import resolver as sw_resolver
         import registry as sw_registry
-    except ImportError:
-        return None, None
-    # find_satisfier was added in softwaresoftware 1.4.0. Older installs lack
-    # it; we fall back to the in-house alphabetical resolver in that case so
-    # taskpilot keeps working until the user reinstalls softwaresoftware.
-    if not hasattr(sw_resolver, "find_satisfier"):
-        return None, None
+    except ImportError as e:
+        raise RuntimeError(f"softwaresoftware import failed: {e}")
     return sw_resolver, sw_registry
 
 
 def resolve_capabilities(capabilities: list[str]) -> list[str]:
     """Resolve capability names to installed plugin directory paths.
 
-    Delegates to softwaresoftware's `resolver.find_satisfier` so we get
-    the same environment-aware provider selection that the install-time
-    resolver uses (matches binary/os/mcp probes per provider). For each
+    Delegates to softwaresoftware's `resolver.find_satisfier`. For each
     capability:
 
       * type=plugin → returns the plugin's installed path (added to --plugin-dir).
@@ -218,64 +213,25 @@ def resolve_capabilities(capabilities: list[str]) -> list[str]:
       * type=host   → cross-host satisfaction; out of scope for local spawn.
       * type=none   → no satisfier; silently skipped.
 
-    Falls back to a simple alphabetical-first walk over installed_plugins.json
-    if softwaresoftware isn't installed (e.g. in tests or pre-install).
+    Hard-fails (RuntimeError) if softwaresoftware isn't installed.
     """
     if not capabilities:
         return []
 
     sw_resolver, sw_registry = _import_softwaresoftware()
-    if sw_resolver and sw_registry:
-        resolved: list[str] = []
-        seen: set[str] = set()
-        for cap in capabilities:
-            sat = sw_resolver.find_satisfier(cap)
-            if sat.get("type") != "plugin":
-                continue
-            path = sw_registry.get_plugin_install_path(sat["name"])
-            if not path:
-                continue
-            p = str(path)
-            if p not in seen:
-                resolved.append(p)
-                seen.add(p)
-        return resolved
-
-    return _resolve_capabilities_fallback(capabilities)
-
-
-def _resolve_capabilities_fallback(capabilities: list[str]) -> list[str]:
-    """Pre-softwaresoftware fallback: walk installed_plugins.json directly,
-    pick the first alphabetical provider for each capability. Used only when
-    softwaresoftware isn't reachable as a Python module."""
-    installed = _read_json(INSTALLED_PLUGINS_PATH)
-    if not installed:
-        return []
-
-    candidates = []
-    for key, entries in installed.get("plugins", {}).items():
-        if not entries:
-            continue
-        name = key.split("@")[0]
-        path = entries[0].get("installPath")
-        if not path or not Path(path).exists():
-            continue
-        manifest = _read_json(Path(path) / ".claude-plugin" / "plugin.json")
-        provides = (manifest or {}).get("provides") or []
-        if provides:
-            candidates.append((name, path, set(provides)))
-
-    candidates.sort(key=lambda c: c[0])
-
-    resolved = []
-    seen = set()
+    resolved: list[str] = []
+    seen: set[str] = set()
     for cap in capabilities:
-        for name, path, provides in candidates:
-            if cap in provides and path not in seen:
-                resolved.append(path)
-                seen.add(path)
-                break
-
+        sat = sw_resolver.find_satisfier(cap)
+        if sat.get("type") != "plugin":
+            continue
+        path = sw_registry.get_plugin_install_path(sat["name"])
+        if not path:
+            continue
+        p = str(path)
+        if p not in seen:
+            resolved.append(p)
+            seen.add(p)
     return resolved
 
 

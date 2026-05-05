@@ -144,103 +144,58 @@ class TestWriteTaskConfig:
 
 
 class TestResolveCapabilities:
+    """resolve_capabilities now hard-delegates to softwaresoftware. All tests
+    mock _import_softwaresoftware to control what find_satisfier returns."""
+
     @pytest.fixture()
-    def installed(self, tmp_path):
-        """Helper that builds a fake installed_plugins.json + manifests on disk.
-
-        Returns a callable that writes the registry. Each call accepts a list
-        of (plugin_key, provides_list) and creates a real dir per plugin so
-        the resolver's existence check passes.
-        """
-        installed_path = tmp_path / "installed.json"
-
-        def write(entries):
-            registry = {"version": 2, "plugins": {}}
-            for key, provides in entries:
-                name = key.split("@")[0]
-                plugin_dir = tmp_path / name
-                (plugin_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
-                (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
-                    json.dumps({"name": name, "provides": provides})
-                )
-                registry["plugins"][key] = [{"installPath": str(plugin_dir)}]
-            installed_path.write_text(json.dumps(registry))
-            return tmp_path
-
-        with patch.object(spawner, "INSTALLED_PLUGINS_PATH", installed_path):
-            yield write
-
-    def test_resolves_installed_provider(self, installed):
-        """Returns installPath when provider is installed."""
-        root = installed([("memory-file@softwaresoftware-plugins", ["memory"])])
-        assert spawner.resolve_capabilities(["memory"]) == [str(root / "memory-file")]
-
-    def test_unsatisfied_capability_returns_nothing(self, installed):
-        """Capability with no installed provider is silently skipped."""
-        installed([("memory-file@softwaresoftware-plugins", ["memory"])])
-        assert spawner.resolve_capabilities(["notification"]) == []
-
-    def test_no_registry_returns_empty(self, tmp_path):
-        """Missing installed_plugins.json returns nothing, no exception."""
-        with patch.object(spawner, "INSTALLED_PLUGINS_PATH", tmp_path / "missing.json"):
-            assert spawner.resolve_capabilities(["memory"]) == []
-
-    def test_alphabetical_tiebreak(self, installed):
-        """When multiple plugins provide the same capability, alphabetical wins."""
-        root = installed([
-            ("notify-slack@softwaresoftware-plugins", ["notification"]),
-            ("notify-linux@softwaresoftware-plugins", ["notification"]),
-        ])
-        # notify-linux sorts before notify-slack
-        assert spawner.resolve_capabilities(["notification"]) == [str(root / "notify-linux")]
-
-    def test_dedupes_one_plugin_many_capabilities(self, installed):
-        """A plugin satisfying multiple requested capabilities appears once."""
-        root = installed([
-            ("multi@softwaresoftware-plugins", ["memory", "notification"]),
-        ])
-        assert spawner.resolve_capabilities(["memory", "notification"]) == [str(root / "multi")]
-
-    def test_skips_missing_install_path(self, installed):
-        """An installed_plugins entry pointing at a deleted dir is silently skipped."""
-        root = installed([("memory-file@softwaresoftware-plugins", ["memory"])])
-        # Nuke the on-disk dir; registry still references it.
-        import shutil as _shutil
-        _shutil.rmtree(root / "memory-file")
-        assert spawner.resolve_capabilities(["memory"]) == []
-
-    def test_delegates_to_softwaresoftware_when_available(self, tmp_path):
-        """When softwaresoftware's resolver+registry are importable, resolve_capabilities
-        delegates to find_satisfier instead of using the alphabetical fallback."""
+    def sw(self, tmp_path):
+        """A mocked softwaresoftware (resolver, registry) pair, scriptable per-test."""
         from unittest.mock import MagicMock
         sw_resolver = MagicMock()
         sw_registry = MagicMock()
-        # Simulate a 'memory' capability satisfied by an installed plugin.
-        sw_resolver.find_satisfier.return_value = {"type": "plugin", "name": "memory-file"}
-        sw_registry.get_plugin_install_path.return_value = tmp_path / "memory-file"
-
         with patch.object(spawner, "_import_softwaresoftware",
                           return_value=(sw_resolver, sw_registry)):
-            result = spawner.resolve_capabilities(["memory"])
+            yield sw_resolver, sw_registry, tmp_path
 
-        assert result == [str(tmp_path / "memory-file")]
+    def test_resolves_installed_provider(self, sw):
+        sw_resolver, sw_registry, tmp_path = sw
+        sw_resolver.find_satisfier.return_value = {"type": "plugin", "name": "memory-file"}
+        sw_registry.get_plugin_install_path.return_value = tmp_path / "memory-file"
+        assert spawner.resolve_capabilities(["memory"]) == [str(tmp_path / "memory-file")]
         sw_resolver.find_satisfier.assert_called_once_with("memory")
 
-    def test_skips_mcp_and_host_satisfiers(self, tmp_path):
+    def test_dedupes_one_plugin_many_capabilities(self, sw):
+        """A plugin satisfying multiple requested capabilities appears once."""
+        sw_resolver, sw_registry, tmp_path = sw
+        sw_resolver.find_satisfier.return_value = {"type": "plugin", "name": "multi"}
+        sw_registry.get_plugin_install_path.return_value = tmp_path / "multi"
+        assert spawner.resolve_capabilities(["memory", "notification"]) == [str(tmp_path / "multi")]
+
+    def test_skips_mcp_and_host_satisfiers(self, sw):
         """type=mcp / type=host / type=none don't add a --plugin-dir."""
-        from unittest.mock import MagicMock
-        sw_resolver = MagicMock()
-        sw_registry = MagicMock()
+        sw_resolver, sw_registry, _ = sw
         sw_resolver.find_satisfier.side_effect = [
             {"type": "mcp", "name": "slack-mcp"},
             {"type": "host", "host": "pixel-7-pro", "self": False},
             {"type": "none"},
         ]
-
-        with patch.object(spawner, "_import_softwaresoftware",
-                          return_value=(sw_resolver, sw_registry)):
-            result = spawner.resolve_capabilities(["notification", "send-sms", "unknown"])
-
-        assert result == []
-        # Registry shouldn't have been queried — no plugin-type satisfiers.
+        assert spawner.resolve_capabilities(["notification", "send-sms", "unknown"]) == []
         sw_registry.get_plugin_install_path.assert_not_called()
+
+    def test_skips_when_install_path_missing(self, sw):
+        """find_satisfier says plugin, but registry returns no path → skip."""
+        sw_resolver, sw_registry, _ = sw
+        sw_resolver.find_satisfier.return_value = {"type": "plugin", "name": "ghost"}
+        sw_registry.get_plugin_install_path.return_value = None
+        assert spawner.resolve_capabilities(["memory"]) == []
+
+    def test_empty_capabilities_short_circuits(self):
+        """No capabilities → return [] without touching softwaresoftware."""
+        # No mock — would explode if _import_softwaresoftware was called.
+        assert spawner.resolve_capabilities([]) == []
+
+    def test_raises_when_softwaresoftware_missing(self, tmp_path):
+        """Hard-fail when softwaresoftware isn't installed — no fallback."""
+        with patch.object(spawner, "INSTALLED_PLUGINS_PATH", tmp_path / "missing.json"):
+            with pytest.raises(RuntimeError, match="softwaresoftware"):
+                spawner.resolve_capabilities(["memory"])
