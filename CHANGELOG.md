@@ -1,0 +1,36 @@
+# Changelog
+
+All notable changes to taskpilot.
+
+## 0.8.0 — 2026-05-06
+
+### Added
+
+- **Persistent pane logs.** Tmux pane output is now teed to `~/.taskpilot/<task_id>/pane.log` via `tmux pipe-pane`. The file survives task completion, kill, and reconciler respawn — so `get_task_log` (and downstream consumers like taskboard) can read agent history after the tmux session is gone.
+- **Three-tier `get_task_log` read**: live tmux pane (`source: "tmux"`) → persisted `pane.log` (`source: "pane.log"`) → 404. The new `source` field in the response indicates which tier served the call. Existing callers reading only `output` are unaffected.
+- **Pre-kill flush** in `actions.mark_completed_and_kill`. Steady path (pipe-pane was attached this invocation) toggles off the tee, drains briefly, writes a `=== completed ===` separator, then runs the detached kill. Legacy path (no sentinel — task pre-dates the upgrade or pipe-pane install failed) does a `tmux capture-pane -p -S -` into `pane.log` before the kill, so existing tasks completing through the upgrade boundary still get their content recovered.
+- **Soft size cap** at spawn boundaries. Default 10 MB per `pane.log`; head-truncates to last 5 MB plus a marker on overflow. Configurable via `TASKPILOT_PANE_LOG_MAX_BYTES` (minimum 4 KB).
+- **Invocation separators** in `pane.log`. Each spawn appends `=== taskpilot invocation N at <iso> reason=start|respawn ===` so users grepping accumulated logs can tell where each invocation begins.
+- **Sentinel file** `pane.log.attached` in each task dir. Marks pipe-pane successful attach this invocation; the discriminator for the steady-vs-legacy completion path. Removed automatically by `destroy_task`'s rmtree.
+
+### Changed
+
+- `tmux capture-pane` calls now pin the target as `<session>:0.0` (defensive against future window additions to the spawn flow).
+- `mark_completed_and_kill` uses `spawner.tmux_session_name(task_id)` rather than assuming `task_id == session` directly.
+- The 404 message from `get_log` is now `"no log available"` (was `"Failed to capture pane"`); semantically equivalent for callers.
+
+### Limitations
+
+- **Long-running services that don't crash** will grow `pane.log` unboundedly between respawns. The size cap only enforces at spawn boundaries. Reconciler-side mid-flight rotation is tracked in `TODO_v0.8.1.md`.
+- **Remote tasks** (`host` set, spawn forwarded to a peer host) get `pane.log` on the peer; local `get_task_log` for remote tasks 404s. This is unchanged from prior behavior.
+- **Windows is unsupported** — relies on POSIX tmux, `stdbuf` (optional), and POSIX file modes. Existing taskpilot constraint, unchanged.
+
+### Migration
+
+- No DB schema changes. Uses existing `invocation_count` column.
+- Existing running tasks pick up `pane.log` capture on their next spawn (`kind=service` reconciler respawn) or completion (`kind=task` going through the legacy path).
+- No data is lost.
+
+## 0.7.x and earlier
+
+See git history.

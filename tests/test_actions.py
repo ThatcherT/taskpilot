@@ -21,15 +21,22 @@ def isolated_taskpilot_dir(tmp_path, monkeypatch):
 class TestMarkCompletedAndKill:
     def test_updates_db_status(self, isolated_taskpilot_dir):
         with patch.object(actions, "store") as mock_store, \
-             patch.object(actions.subprocess, "Popen") as mock_popen:
+             patch.object(actions.subprocess, "Popen") as mock_popen, \
+             patch.object(actions.subprocess, "run") as mock_run:
             mock_conn = MagicMock()
             mock_store.get_db.return_value = mock_conn
+            mock_run.return_value = MagicMock(returncode=0)
 
             actions.mark_completed_and_kill("my-task")
 
             mock_store.update_status.assert_called_once_with(mock_conn, "my-task", "completed")
             mock_conn.close.assert_called_once()
-            mock_popen.assert_called_once()
+            # kill-session must be among the Popen calls (legacy path captures via run, steady toggles via run).
+            kill_calls = [
+                c for c in mock_popen.call_args_list
+                if "kill-session" in c[0][0]
+            ]
+            assert len(kill_calls) == 1
 
     def test_kills_tmux_session(self, isolated_taskpilot_dir):
         with patch.object(actions, "store"), \
@@ -43,10 +50,16 @@ class TestMarkCompletedAndKill:
     def test_db_failure_does_not_block_kill(self, isolated_taskpilot_dir):
         # If store.get_db raises, we should still kill tmux (and not raise).
         with patch.object(actions, "store") as mock_store, \
-             patch.object(actions.subprocess, "Popen") as mock_popen:
+             patch.object(actions.subprocess, "Popen") as mock_popen, \
+             patch.object(actions.subprocess, "run") as mock_run:
             mock_store.get_db.side_effect = RuntimeError("db gone")
+            mock_run.return_value = MagicMock(returncode=0)
             actions.mark_completed_and_kill("my-task")
-            mock_popen.assert_called_once()
+            kill_calls = [
+                c for c in mock_popen.call_args_list
+                if "kill-session" in c[0][0]
+            ]
+            assert len(kill_calls) == 1
 
     def test_tmux_failure_does_not_raise(self, isolated_taskpilot_dir):
         with patch.object(actions, "store"), \

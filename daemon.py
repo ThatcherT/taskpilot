@@ -28,6 +28,7 @@ from pydantic import BaseModel
 # We're a sibling of server.py / spawner.py / store.py
 sys.path.insert(0, str(Path(__file__).parent))
 import spawner
+import tail
 import store
 
 DEFAULT_PORT = 8912
@@ -233,23 +234,48 @@ def get_task(task_id: str) -> dict:
     return task
 
 
-@app.get("/tasks/{task_id}/log")
-def get_log(task_id: str, lines: int = 50) -> dict:
-    """Capture the last N lines of a task's tmux pane."""
+def _capture_live(task_id: str, lines: int) -> dict | None:
+    """Live-tmux capture; returns None when session is gone or capture fails."""
     session = spawner.tmux_session_name(task_id)
+    if not spawner.is_tmux_alive(task_id):
+        return None
     try:
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session, "-p"],
+            ["tmux", "capture-pane", "-t", f"{session}:0.0", "-p"],
             capture_output=True,
             text=True,
             timeout=5,
         )
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="timeout capturing pane")
+        return None
     if result.returncode != 0:
-        raise HTTPException(status_code=404, detail=f"tmux session '{session}' not found")
-    output_lines = result.stdout.strip().split("\n")
-    return {"task_id": task_id, "output": "\n".join(output_lines[-lines:])}
+        return None
+    return {"output": tail.tail_str(result.stdout, lines), "source": "tmux"}
+
+
+def _read_pane_log(task_id: str, lines: int) -> dict | None:
+    """File-tail of pane.log; returns None when the file is absent."""
+    p = spawner.pane_log_path(task_id)
+    if not p.exists():
+        return None
+    return {"output": tail.tail_lines(p, lines), "source": "pane.log"}
+
+
+@app.get("/tasks/{task_id}/log")
+def get_log(task_id: str, lines: int = 50) -> dict:
+    """Three-tier log read: live tmux pane → pane.log file → 404.
+
+    `source` field in the response indicates which tier served the call:
+      "tmux"     — live capture-pane (richer formatting; current state)
+      "pane.log" — persistent file (history after task ends)
+    """
+    live = _capture_live(task_id, lines)
+    if live is not None:
+        return {"task_id": task_id, **live}
+    file_result = _read_pane_log(task_id, lines)
+    if file_result is not None:
+        return {"task_id": task_id, **file_result}
+    raise HTTPException(status_code=404, detail="no log available")
 
 
 # --- Write endpoints ---

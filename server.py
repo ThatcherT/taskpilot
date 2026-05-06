@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 import scheduler
 import spawner
 import store
+import tail
 
 mcp = FastMCP("taskpilot")
 
@@ -362,32 +363,49 @@ def kill_task(task_id: str) -> dict:
 def get_task_log(task_id: str, lines: int = 50) -> dict:
     """Read recent output from a task's tmux pane.
 
+    Three-tier read: live tmux pane → persisted pane.log file → error.
+    The `source` field in the response indicates which tier served the call.
+
     Args:
         task_id: The task ID.
         lines: Number of lines to capture (default 50).
 
     Returns:
-        Captured pane output.
+        {task_id, output, source} on success;
+        {error, hint?} on failure.
     """
     daemon_result = _daemon_call("GET", f"/tasks/{task_id}/log?lines={lines}")
     if daemon_result is not None:
         return daemon_result
 
-    # Daemon down — direct fallback.
+    # Daemon down — direct fallback. Uses the same three-tier logic.
     session = spawner.tmux_session_name(task_id)
-    try:
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", session, "-p"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return {"error": f"Failed to capture pane: {result.stderr}"}
-        output_lines = result.stdout.strip().split("\n")
-        return {"output": "\n".join(output_lines[-lines:])}
-    except subprocess.TimeoutExpired:
-        return {"error": "Timeout capturing pane"}
+    if spawner.is_tmux_alive(task_id):
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", f"{session}:0.0", "-p"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return {
+                    "task_id": task_id,
+                    "output": tail.tail_str(result.stdout, lines),
+                    "source": "tmux",
+                }
+        except subprocess.TimeoutExpired:
+            pass
+
+    pane_log = spawner.pane_log_path(task_id)
+    if pane_log.exists():
+        return {
+            "task_id": task_id,
+            "output": tail.tail_lines(pane_log, lines),
+            "source": "pane.log",
+        }
+
+    return {"error": "no log available", "hint": "task may have been destroyed or never ran"}
 
 
 @mcp.tool()

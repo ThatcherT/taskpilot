@@ -9,11 +9,14 @@ session-bridge channel.mjs reads that env var and includes it in its
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 TASKPILOT_DIR = Path.home() / ".taskpilot"
@@ -33,6 +36,172 @@ def slugify(name: str) -> str:
 
 def task_dir(task_id: str) -> Path:
     return TASKPILOT_DIR / task_id
+
+
+# --- pane.log persistent log capture (v0.8.0) ---------------------------------
+# Tmux pane buffers are ephemeral: they die with the session. We tee pane output
+# to ~/.taskpilot/<task_id>/pane.log via `tmux pipe-pane` so completion-path
+# `get_task_log` and downstream consumers (taskboard) can read agent history
+# after the task is gone. Sentinel file pane.log.attached marks successful
+# attach this invocation; mark_completed_and_kill keys on it to choose between
+# steady (toggle-off) and legacy (capture-pane) flush paths.
+
+PANE_LOG_NAME = "pane.log"
+PANE_LOG_SENTINEL_NAME = "pane.log.attached"
+PANE_LOG_MAX_BYTES_DEFAULT = 10 * 1024 * 1024
+PANE_LOG_MIN_BYTES = 4096
+
+
+def pane_log_path(task_id: str) -> Path:
+    return task_dir(task_id) / PANE_LOG_NAME
+
+
+def pane_log_sentinel(task_id: str) -> Path:
+    return task_dir(task_id) / PANE_LOG_SENTINEL_NAME
+
+
+def _pane_log_max_bytes() -> int:
+    raw = os.environ.get("TASKPILOT_PANE_LOG_MAX_BYTES", "")
+    try:
+        return max(int(raw), PANE_LOG_MIN_BYTES) if raw else PANE_LOG_MAX_BYTES_DEFAULT
+    except ValueError:
+        return PANE_LOG_MAX_BYTES_DEFAULT
+
+
+def _truncate_if_oversize(path: Path) -> None:
+    """Soft cap on pane.log, enforced at spawn boundaries.
+
+    Keeps the last cap/2 bytes plus a truncation marker. Atomic via tmp+rename
+    (POSIX). Note: this does NOT fsync the parent directory; rename durability
+    rests on the filesystem journal. Acceptable for a soft-cap log.
+
+    Long-running services that don't crash will grow pane.log unboundedly
+    between respawns — reconciler-side rotation is a v0.8.1 follow-up.
+    """
+    if not path.exists():
+        return
+    cap = _pane_log_max_bytes()
+    size = path.stat().st_size
+    if size <= cap:
+        return
+    keep = cap // 2
+    with path.open("rb") as f:
+        f.seek(size - keep)
+        tail_bytes = f.read()
+    now = datetime.now(timezone.utc).isoformat()
+    marker = f"\n=== truncated {size - keep} bytes (cap={cap}) at {now} ===\n".encode()
+    tmp = path.with_suffix(".log.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, marker)
+        os.write(fd, tail_bytes)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    tmp.replace(path)
+
+
+def _write_invocation_separator(path: Path, task_id: str) -> None:
+    """Append `=== taskpilot invocation N at <iso> reason=start|respawn ===` to pane.log.
+
+    Reads invocation_count from the DB. spawn_tmux runs BEFORE
+    store.increment_invocation at every call site (daemon.py reconciler,
+    daemon.py spawn endpoint, server.py direct fallback), so the DB count
+    here is the *previous* invocation; the new invocation is db_count + 1.
+    """
+    # Lazy import to avoid circular deps at module load (store imports
+    # nothing from spawner, but we keep the boundary clean).
+    import store  # noqa: WPS433
+
+    conn = store.get_db()
+    try:
+        task = store.get_task(conn, task_id)
+        prev_count = (task or {}).get("invocation_count", 0)
+    finally:
+        conn.close()
+    invocation = prev_count + 1
+    reason = "start" if invocation == 1 else "respawn"
+    now = datetime.now(timezone.utc).isoformat()
+    sep = f"\n=== taskpilot invocation {invocation} at {now} reason={reason} ===\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, sep.encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _install_pipe_pane(session: str, path: Path) -> bool:
+    """Attach `tmux pipe-pane` from the session's first pane to `path`.
+
+    Returns True if `tmux pipe-pane` exited 0; False otherwise. Failure is
+    non-fatal: spawn must not depend on log infrastructure.
+
+    `stdbuf -o0` is a *latency* optimization — without it, `cat` block-buffers
+    writes to the file, delaying live `tail -f`. `cat` still flushes on EOF
+    (when tmux closes the pipe FD), so no data is lost in either case.
+    """
+    quoted = shlex.quote(str(path))
+    if shutil.which("stdbuf"):
+        shell_cmd = f"stdbuf -o0 cat >> {quoted}"
+    else:
+        shell_cmd = f"cat >> {quoted}"
+    target = f"{session}:0.0"
+    try:
+        result = subprocess.run(
+            ["tmux", "pipe-pane", "-t", target, shell_cmd],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.returncode == 0
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(
+            f"taskpilot: pipe-pane install failed for {session}: {e}\n",
+        )
+        return False
+
+
+def _setup_pane_log_capture(task_id: str, session: str) -> None:
+    """Wire pipe-pane tee + sentinel for this invocation.
+
+    Sequence: truncate (if oversized) → write invocation separator → attach
+    pipe-pane → manage sentinel based on attach result.
+    """
+    path = pane_log_path(task_id)
+    sentinel = pane_log_sentinel(task_id)
+    try:
+        _truncate_if_oversize(path)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"taskpilot: pane.log truncate failed for {task_id}: {e}\n")
+    try:
+        _write_invocation_separator(path, task_id)
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"taskpilot: separator write failed for {task_id}: {e}\n")
+    attached = _install_pipe_pane(session, path)
+    if attached:
+        # Create sentinel with mode 0600 (born at correct mode via os.open).
+        try:
+            fd = os.open(
+                str(sentinel),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            os.close(fd)
+        except OSError as e:
+            sys.stderr.write(f"taskpilot: sentinel write failed for {task_id}: {e}\n")
+    else:
+        # Carryover sentinel from a prior successful invocation must not survive
+        # a failed attach — completion path would otherwise take the steady
+        # branch and lose recoverable scrollback.
+        try:
+            sentinel.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            sys.stderr.write(f"taskpilot: sentinel unlink failed for {task_id}: {e}\n")
 
 
 def write_task_config(
@@ -366,6 +535,11 @@ cd {td} && claude --dangerously-skip-permissions \\
     )
     if result.returncode != 0:
         return False
+
+    # Tee pane output to ~/.taskpilot/<task_id>/pane.log so post-completion
+    # `get_task_log` can read history. Failure is non-fatal — spawn proceeds
+    # even if the tee can't be installed.
+    _setup_pane_log_capture(task_id, session)
 
     # Auto-accept trust dialog
     time.sleep(7)
