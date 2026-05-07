@@ -441,6 +441,115 @@ def _session_labels(kind: str) -> str:
     return f"kind:{kind}"
 
 
+def sandbox_home(task_id: str) -> Path:
+    """Filesystem path used as $HOME for the spawned claude process.
+
+    Resolves under the task's directory so per-task state is colocated and
+    cleanable. The agent's `~/.claude/*` reads land here instead of the
+    user's real $HOME — that's the entire point of the sandbox.
+    """
+    return task_dir(task_id) / "home"
+
+
+def prepare_sandbox(task_id: str, allowed_plugins: list[str] | None = None,
+                    declared_mcps: dict | None = None) -> Path:
+    """Build a curated $HOME for the agent so it doesn't inherit the user's
+    daily-driver Claude environment (CLAUDE.md, rules, MCPs, plugin list).
+
+    Layout:
+      ~/.taskpilot/<task_id>/home/
+        .claude/
+          plugins/
+            cache/                -> symlink to user's real cache (so plugin
+                                     files exist without copying gigabytes)
+            installed_plugins.json  -> only `allowed_plugins` listed
+            known_marketplaces.json -> symlink to user's (for marketplace lookups)
+          projects/               (transcripts land here, isolated per-agent)
+          settings.json           ({} — no global settings)
+          # NOTE: no CLAUDE.md, no rules/, no hooks/. The agent's task-specific
+          # context comes from the cwd CLAUDE.md (which sits at task_dir).
+        .claude.json              (only `declared_mcps`, no global servers)
+
+    Re-runs are idempotent: existing files/symlinks get rebuilt cleanly.
+    """
+    home = sandbox_home(task_id)
+    claude_dir = home / ".claude"
+    home.mkdir(parents=True, exist_ok=True)
+    claude_dir.mkdir(exist_ok=True)
+    (claude_dir / "projects").mkdir(exist_ok=True)
+
+    # Sessions — Claude Code writes its session.json (with the session_id) here,
+    # and session-bridge daemon discovers sessions by scanning this dir from the
+    # user's real $HOME. If the sandbox keeps its own sessions dir, the bridge
+    # never sees the agent and registration fails. Sessions files are pid-keyed
+    # so collisions are impossible; sharing the real dir is safe.
+    real_sessions = Path.home() / ".claude" / "sessions"
+    sandbox_sessions = claude_dir / "sessions"
+    if sandbox_sessions.is_symlink() or sandbox_sessions.exists():
+        if sandbox_sessions.is_symlink():
+            sandbox_sessions.unlink()
+        elif sandbox_sessions.is_dir():
+            shutil.rmtree(sandbox_sessions)
+    real_sessions.mkdir(parents=True, exist_ok=True)
+    sandbox_sessions.symlink_to(real_sessions)
+
+    # Plugins — symlink the user's whole `plugins/` dir into the sandbox.
+    # The plugin loader has a tangle of files that reference each other
+    # (cache/, marketplaces/, installed_plugins.json, known_marketplaces.json,
+    # data/, config.json, blocklist.json, install-counts-cache.json …). Forking
+    # subsets is fragile; the simpler invariant is "all plugins are findable;
+    # we curate which ones run via enabledPlugins below."
+    real_plugins_dir = Path.home() / ".claude" / "plugins"
+    sandbox_plugins_dir = claude_dir / "plugins"
+    if sandbox_plugins_dir.is_symlink() or sandbox_plugins_dir.exists():
+        if sandbox_plugins_dir.is_symlink():
+            sandbox_plugins_dir.unlink()
+        elif sandbox_plugins_dir.is_dir():
+            shutil.rmtree(sandbox_plugins_dir)
+    if real_plugins_dir.exists():
+        sandbox_plugins_dir.symlink_to(real_plugins_dir)
+
+    # Curate which plugins actually load by setting enabledPlugins. Anything
+    # not in this list stays installed but inert — its skills don't get
+    # injected into the system prompt, its tools aren't exposed.
+    real_installed = _read_json(INSTALLED_PLUGINS_PATH) or {}
+    real_plugins = real_installed.get("plugins", {})
+    keep = set(allowed_plugins or [])
+    keep.add("session-bridge@softwaresoftware-plugins")  # always — required for the channel
+    keep.add("taskpilot@softwaresoftware-plugins")       # always — its hooks fire on Stop/Notification
+    enabled_plugins = {key: True for key in real_plugins.keys() if key in keep}
+
+    settings_payload = {
+        "enabledPlugins": enabled_plugins,
+    }
+    (claude_dir / "settings.json").write_text(json.dumps(settings_payload, indent=2))
+
+    # OAuth credentials — symlink the user's so the agent doesn't get stuck
+    # at the login screen. We're not isolating auth, just config.
+    real_creds = Path.home() / ".claude" / ".credentials.json"
+    sandbox_creds = claude_dir / ".credentials.json"
+    if sandbox_creds.is_symlink() or sandbox_creds.exists():
+        sandbox_creds.unlink()
+    if real_creds.exists():
+        sandbox_creds.symlink_to(real_creds)
+
+    # .claude.json — Claude Code reads this for account/onboarding state
+    # (oauthAccount, hasCompletedOnboarding, autoPermissionsNotificationCount,
+    # feature flags, …) AND for `mcpServers` and `projects`. We want the
+    # account/onboarding bits (so the agent doesn't re-run login or stall on
+    # bypass-permissions warnings) but NOT the user's daily-driver MCP list
+    # or per-project history. Allowlisting account keys is brittle — Claude
+    # Code adds new ones every release. Block-list instead: copy everything,
+    # then strip the bits we want curated.
+    real_user = _read_json(CLAUDE_JSON) or {}
+    blocked = {"mcpServers", "projects"}
+    claude_json_payload = {k: v for k, v in real_user.items() if k not in blocked}
+    claude_json_payload["mcpServers"] = dict(declared_mcps or {})
+    (home / ".claude.json").write_text(json.dumps(claude_json_payload, indent=2))
+
+    return home
+
+
 def write_hook_settings(task_id: str) -> Path:
     """Write a per-task settings file that registers Stop, Notification, and
     UserPromptSubmit hooks.
@@ -478,6 +587,20 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
 
     # Per-task hooks (Stop, Notification) → ~/.taskpilot/<id>/state/agent.json
     hook_settings = write_hook_settings(task_id)
+
+    # Build a curated $HOME so the agent doesn't inherit the user's daily-driver
+    # ~/.claude environment (global CLAUDE.md, rules, every installed plugin's
+    # skills, every registered MCP). Without this, beats-dj loaded ~30k+ tokens
+    # of irrelevant context (phone bridge instructions, contact list, etc.) at
+    # every restart.
+    declared_plugin_keys = []
+    for p in plugins:
+        # `plugins` here is a list of filesystem paths passed to --plugin-dir.
+        # The corresponding installed_plugins.json key isn't derivable from the
+        # path; rely on the symlinked cache making them findable, and trust the
+        # --plugin-dir flag itself for the explicit ones.
+        pass
+    home = prepare_sandbox(task_id, allowed_plugins=declared_plugin_keys)
 
     # Build plugin-dir flags
     plugin_flags = ""
@@ -520,7 +643,8 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     #   SESSION_LABELS    — same
     #   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false — no human is at the keyboard
     #     in a spawned agent, so the forked-suggestion LLM call is pure waste.
-    cmd = f"""export TASKPILOT_TASK_ID={task_id}
+    cmd = f"""export HOME={home}
+export TASKPILOT_TASK_ID={task_id}
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export SESSION_LABELS={labels}
@@ -544,11 +668,19 @@ cd {td} && claude --dangerously-skip-permissions \\
     # even if the tee can't be installed.
     _setup_pane_log_capture(task_id, session)
 
-    # Auto-accept trust dialog
+    # Auto-accept trust dialog (option 1, "Yes, I trust this folder", is default)
     time.sleep(7)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
 
-    # Auto-accept channels warning
+    # Auto-accept bypass-permissions warning. With a sandboxed HOME the agent
+    # sees this dialog every spawn. Default selection is "1. No, exit" — naive
+    # Enter would exit. Type "2" then Enter to select "Yes, I accept".
+    time.sleep(3)
+    subprocess.run(["tmux", "send-keys", "-t", session, "2"])
+    time.sleep(0.3)
+    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
+
+    # Auto-accept channels warning (default option is fine here)
     time.sleep(4)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
 
