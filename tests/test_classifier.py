@@ -1,134 +1,149 @@
-"""Tests for classifier — buckets the agent's final message."""
+"""Tests for classifier — buckets the agent's final message via LLM judge.
 
+The classifier shells out to `claude -p`. These tests mock the subprocess so
+they're hermetic; we cover prompt construction, output parsing, and the
+fail-soft path (any error → uneventful).
+"""
+
+import json
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import classifier
 
 
-class TestClassifyUneventful:
+def _mock_run(stdout: str = "", returncode: int = 0):
+    """Build a fake CompletedProcess for patching subprocess.run."""
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+class TestNoJudgeCalls:
+    """Cases that short-circuit before invoking the subprocess."""
+
     def test_empty_string(self):
-        assert classifier.classify("") == "uneventful"
+        with patch("classifier.subprocess.run") as run:
+            assert classifier.classify("") == "uneventful"
+            run.assert_not_called()
 
     def test_none(self):
-        assert classifier.classify(None) == "uneventful"
-
-    def test_plain_statement(self):
-        assert classifier.classify("Reading the file now.") == "uneventful"
-
-    def test_mid_flow_punctuation(self):
-        assert classifier.classify("Got it. Continuing with the next step.") == "uneventful"
+        with patch("classifier.subprocess.run") as run:
+            assert classifier.classify(None) == "uneventful"
+            run.assert_not_called()
 
 
-class TestClassifyResolved:
-    def test_task_complete(self):
-        assert classifier.classify("Task complete.") == "resolved"
+class TestVerdictParsing:
+    def test_resolved_bare(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("resolved")):
+            assert classifier.classify("Done.") == "resolved"
 
-    def test_task_is_complete(self):
-        assert classifier.classify("The task is complete.") == "resolved"
+    def test_question_bare(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("question")):
+            assert classifier.classify("Should I proceed?") == "question"
 
-    def test_task_done(self):
-        assert classifier.classify("Task done.") == "resolved"
+    def test_uneventful_bare(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("uneventful")):
+            assert classifier.classify("Reading the file.") == "uneventful"
 
-    def test_task_resolved(self):
-        assert classifier.classify("Task resolved successfully.") == "resolved"
+    def test_handles_trailing_punctuation(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("resolved.")):
+            assert classifier.classify("All wrapped up.") == "resolved"
 
-    def test_task_finished(self):
-        assert classifier.classify("Task finished.") == "resolved"
+    def test_handles_capitalization(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("RESOLVED")):
+            assert classifier.classify("Finished.") == "resolved"
 
-    def test_all_done(self):
-        assert classifier.classify("All done!") == "resolved"
-
-    def test_everything_done(self):
-        assert classifier.classify("Everything done, tests pass.") == "resolved"
-
-    def test_nothing_left_to_do(self):
-        assert classifier.classify("Nothing left to do here.") == "resolved"
-
-    def test_nothing_else_to_do(self):
-        assert classifier.classify("Nothing else to do.") == "resolved"
-
-    def test_finished_the_work(self):
-        assert classifier.classify("Finished the work.") == "resolved"
-
-    def test_finished_the_job(self):
-        assert classifier.classify("Finished the job.") == "resolved"
-
-    def test_wrapping_up(self):
-        assert classifier.classify("Wrapping up now.") == "resolved"
-
-    def test_marking_complete(self):
-        assert classifier.classify("Marking this complete.") == "resolved"
-
-    def test_marking_task_complete(self):
-        assert classifier.classify("Marking the task complete.") == "resolved"
-
-    def test_case_insensitive(self):
-        assert classifier.classify("TASK COMPLETE.") == "resolved"
-        assert classifier.classify("Task Done.") == "resolved"
-
-    def test_completion_in_long_message(self):
-        prefix = "Did a bunch of things. " * 20
-        assert classifier.classify(prefix + "Task complete.") == "resolved"
+    def test_handles_explanatory_prefix(self):
+        # Haiku occasionally adds reasoning before the verdict despite the
+        # "one word" instruction. Last-bucket-mentioned wins via membership check.
+        with patch(
+            "classifier.subprocess.run",
+            return_value=_mock_run("The agent met the success criteria. resolved"),
+        ):
+            assert classifier.classify("Done.") == "resolved"
 
 
-class TestClassifyQuestion:
-    def test_simple_question(self):
-        assert classifier.classify("Should I proceed?") == "question"
+class TestFailSoft:
+    def test_subprocess_timeout_returns_uneventful(self):
+        with patch("classifier.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=60)):
+            assert classifier.classify("Done.") == "uneventful"
 
-    def test_question_with_trailing_whitespace(self):
-        assert classifier.classify("Which database?  \n") == "question"
+    def test_claude_binary_missing_returns_uneventful(self):
+        with patch("classifier.subprocess.run", side_effect=FileNotFoundError("claude not found")):
+            assert classifier.classify("Done.") == "uneventful"
 
-    def test_question_with_trailing_markdown_emphasis(self):
-        assert classifier.classify("Want me to continue?*") == "question"
+    def test_nonzero_returncode_returns_uneventful(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("resolved", returncode=1)):
+            assert classifier.classify("Done.") == "uneventful"
 
-    def test_question_with_trailing_quote(self):
-        assert classifier.classify('Did you mean "main"?"') == "question"
+    def test_empty_stdout_returns_uneventful(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("")):
+            assert classifier.classify("Done.") == "uneventful"
 
-    def test_question_with_trailing_paren(self):
-        assert classifier.classify("Should I run it (with verbose)?)") == "question"
-
-    def test_question_after_long_explanation(self):
-        body = "Here's what I found. " * 30
-        assert classifier.classify(body + "Should I proceed?") == "question"
-
-
-class TestClassifyResolvedWinsTies:
-    def test_completion_phrase_with_question_mark(self):
-        # Both signals present — resolved should win.
-        assert classifier.classify("Task complete. Anything else?") == "resolved"
-
-    def test_completion_in_tail_with_trailing_question(self):
-        assert classifier.classify("Wrapping up. Right?") == "resolved"
+    def test_unparseable_output_returns_uneventful(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("¯\\_(ツ)_/¯")):
+            assert classifier.classify("Done.") == "uneventful"
 
 
-class TestClassifyTailWindow:
-    def test_completion_only_in_old_history(self):
-        # Old completion phrase outside the 400-char tail window — should NOT resolve.
-        old = "Task complete." + ("filler text " * 50)  # ~700 chars after completion
-        assert len(old) > 400
-        result = classifier.classify(old)
-        assert result == "uneventful"
+class TestPromptConstruction:
+    def test_brief_loaded_from_task_dir(self, tmp_path, monkeypatch):
+        tid = "test-task-123"
+        task_dir = tmp_path / tid
+        task_dir.mkdir()
+        brief = {
+            "objectives": ["Triage one email."],
+            "success_criteria": ["Slack summary posted.", "Email archived."],
+            "boundaries": ["Do not delete."],
+        }
+        (task_dir / "brief.json").write_text(json.dumps(brief))
+        monkeypatch.setattr(classifier, "_TASKPILOT_DIR", tmp_path)
 
-    def test_completion_at_very_end_within_tail(self):
-        prefix = "filler " * 50  # ~350 chars, ends in whitespace so \b matches
-        msg = prefix + "Task complete."
-        assert classifier.classify(msg) == "resolved"
+        with patch("classifier.subprocess.run", return_value=_mock_run("resolved")) as run:
+            classifier.classify("Archived. Posted summary. Done.", tid)
 
+        prompt = run.call_args.kwargs["input"]
+        assert "Triage one email." in prompt
+        assert "Slack summary posted." in prompt
+        assert "Do not delete." in prompt
+        assert "Archived. Posted summary. Done." in prompt
 
-class TestClassifyEdgeCases:
-    def test_just_a_question_mark(self):
-        assert classifier.classify("?") == "question"
+    def test_missing_brief_does_not_break(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(classifier, "_TASKPILOT_DIR", tmp_path)
+        with patch("classifier.subprocess.run", return_value=_mock_run("uneventful")) as run:
+            assert classifier.classify("Working...", "no-such-task") == "uneventful"
+            assert run.called  # judge still invoked, just with empty brief
 
-    def test_question_mark_inside_no_trailing(self):
-        # Mid-sentence question mark, but ends with a period — not a question.
-        assert classifier.classify("Is this it? Probably not.") == "uneventful"
+    def test_no_task_id_does_not_break(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("resolved")) as run:
+            assert classifier.classify("Done.") == "resolved"
+            assert run.called
+            prompt = run.call_args.kwargs["input"]
+            assert "(no brief available)" in prompt
 
-    def test_word_complete_without_task_context(self):
-        # COMPLETION_PATTERNS require "task complete" specifically, not bare "complete".
-        assert classifier.classify("The build is complete.") == "uneventful"
+    def test_uses_print_and_haiku_flags(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("resolved")) as run:
+            classifier.classify("Done.")
+            argv = run.call_args.args[0]
+            assert "--print" in argv
+            assert "haiku" in argv
 
-    def test_done_alone_does_not_match(self):
-        # Bare "done." doesn't match any pattern — needs "task done" or "all done" etc.
-        assert classifier.classify("done.") == "uneventful"
+    def test_strips_stale_env_vars_from_subprocess(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-key")
+        monkeypatch.setenv("TASKPILOT_TASK_ID", "some-task")
+        monkeypatch.setenv("UNRELATED_VAR", "kept")
+        with patch("classifier.subprocess.run", return_value=_mock_run("resolved")) as run:
+            classifier.classify("Done.")
+            env = run.call_args.kwargs["env"]
+            assert "ANTHROPIC_API_KEY" not in env
+            assert "TASKPILOT_TASK_ID" not in env
+            assert env.get("UNRELATED_VAR") == "kept"
+
+    def test_prompt_passed_via_stdin(self):
+        with patch("classifier.subprocess.run", return_value=_mock_run("resolved")) as run:
+            classifier.classify("Done.")
+            assert "Done." in run.call_args.kwargs["input"]
+            # And NOT as a positional argv (avoids --tools "" trap)
+            argv = run.call_args.args[0]
+            assert "Done." not in argv

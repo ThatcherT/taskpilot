@@ -44,7 +44,7 @@ def main() -> int:
     write_record(tid, "last_stop", record)
     mark_seen(tid)
 
-    bucket = classifier.classify(message)
+    bucket = classifier.classify(message, tid)
     if bucket == "resolved":
         actions.mark_completed_and_kill(tid)
     elif bucket == "question":

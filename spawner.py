@@ -518,10 +518,13 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     #   SESSION_NAME      — read by session-bridge channel.mjs at /register
     #   SESSION_NAMESPACE — same
     #   SESSION_LABELS    — same
+    #   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false — no human is at the keyboard
+    #     in a spawned agent, so the forked-suggestion LLM call is pure waste.
     cmd = f"""export TASKPILOT_TASK_ID={task_id}
 export SESSION_NAME={task_id}
 export SESSION_NAMESPACE={SESSION_NAMESPACE}
 export SESSION_LABELS={labels}
+export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
 cd {td} && claude --dangerously-skip-permissions \\
   --dangerously-load-development-channels {channels_arg} \\
   --settings {hook_settings} \\
