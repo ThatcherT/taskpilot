@@ -444,11 +444,15 @@ def _session_labels(kind: str) -> str:
 def sandbox_home(task_id: str) -> Path:
     """Filesystem path used as $HOME for the spawned claude process.
 
-    Resolves under the task's directory so per-task state is colocated and
-    cleanable. The agent's `~/.claude/*` reads land here instead of the
-    user's real $HOME — that's the entire point of the sandbox.
+    This is the task directory itself — deliberately the same path the agent
+    runs in (its cwd). Claude Code discovers project `.claude/` config (skills,
+    rules, CLAUDE.md) by walking *up* the directory tree from cwd, stopping at
+    $HOME. If HOME is a subdirectory of cwd (or otherwise not an ancestor), the
+    walk climbs past the sandbox into the real `/home/<user>/.claude/` and
+    pulls the user's personal skills + rules back in. Keeping HOME == cwd ==
+    task_dir makes the walk terminate immediately inside the sandbox.
     """
-    return task_dir(task_id) / "home"
+    return task_dir(task_id)
 
 
 def prepare_sandbox(task_id: str, allowed_plugins: list[str] | None = None,
@@ -456,21 +460,26 @@ def prepare_sandbox(task_id: str, allowed_plugins: list[str] | None = None,
     """Build a curated $HOME for the agent so it doesn't inherit the user's
     daily-driver Claude environment (CLAUDE.md, rules, MCPs, plugin list).
 
-    Layout:
-      ~/.taskpilot/<task_id>/home/
-        .claude/
-          plugins/
-            cache/                -> symlink to user's real cache (so plugin
-                                     files exist without copying gigabytes)
-            installed_plugins.json  -> only `allowed_plugins` listed
-            known_marketplaces.json -> symlink to user's (for marketplace lookups)
-          projects/               (transcripts land here, isolated per-agent)
-          settings.json           ({} — no global settings)
-          # NOTE: no CLAUDE.md, no rules/, no hooks/. The agent's task-specific
-          # context comes from the cwd CLAUDE.md (which sits at task_dir).
-        .claude.json              (only `declared_mcps`, no global servers)
+    $HOME is the task directory itself (see sandbox_home) so it equals the
+    agent's cwd — that keeps Claude's project-config directory walk from
+    escaping the sandbox.
 
-    Re-runs are idempotent: existing files/symlinks get rebuilt cleanly.
+    Layout:
+      ~/.taskpilot/<task_id>/                <- $HOME and cwd
+        .claude/
+          plugins/                -> symlink to user's real plugins dir (so
+                                     the loader finds cache + marketplaces)
+          sessions/               -> symlink to user's (session-bridge scans it)
+          projects/               (transcripts land here, isolated per-agent)
+          settings.json           (curated enabledPlugins + carried-forward
+                                   pluginConfigs for the enabled plugins)
+          .credentials.json       -> symlink to user's (no re-login)
+        .claude.json              (account state minus mcpServers + projects)
+        CLAUDE.md                 (task context, written by write_task_config)
+
+    No CLAUDE.md/rules/ from the user's real $HOME are provisioned; the agent's
+    task-specific context comes from the CLAUDE.md write_task_config drops at
+    task_dir. Re-runs are idempotent: existing files/symlinks get rebuilt.
     """
     home = sandbox_home(task_id)
     claude_dir = home / ".claude"
@@ -519,9 +528,28 @@ def prepare_sandbox(task_id: str, allowed_plugins: list[str] | None = None,
     keep.add("taskpilot@softwaresoftware-plugins")       # always — its hooks fire on Stop/Notification
     enabled_plugins = {key: True for key in real_plugins.keys() if key in keep}
 
+    # Carry forward each enabled plugin's userConfig. The sandbox writes its
+    # own settings.json (it can't symlink the user's — enabledPlugins must be
+    # curated), but a plugin enabled here still needs its pluginConfigs entry
+    # or it comes up unconfigured (CLAUDE_PLUGIN_OPTION_* env vars never get
+    # injected). Sensitive values live in the OS keychain, not settings.json,
+    # and resolve fine since the agent runs as the same OS user. Marketplaces
+    # are carried wholesale so the enabled keys' "@<marketplace>" refs resolve.
+    real_settings = _read_json(Path.home() / ".claude" / "settings.json") or {}
+    real_plugin_configs = real_settings.get("pluginConfigs", {})
+    plugin_configs = {k: v for k, v in real_plugin_configs.items() if k in enabled_plugins}
+
     settings_payload = {
         "enabledPlugins": enabled_plugins,
+        "pluginConfigs": plugin_configs,
+        # Skip the bypass-permissions warning. claude writes this after the
+        # user clicks "Yes, I accept" once; pre-setting it here means new
+        # sandboxes don't sit at that dialog and we don't need to send a
+        # post-launch keypress to dismiss it.
+        "skipDangerousModePermissionPrompt": True,
     }
+    if "extraKnownMarketplaces" in real_settings:
+        settings_payload["extraKnownMarketplaces"] = real_settings["extraKnownMarketplaces"]
     (claude_dir / "settings.json").write_text(json.dumps(settings_payload, indent=2))
 
     # OAuth credentials — symlink the user's so the agent doesn't get stuck
@@ -580,27 +608,28 @@ def write_hook_settings(task_id: str) -> Path:
 
 def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
                cwd: str | None = None, channels: list[str] | None = None,
-               kind: str = "task") -> bool:
+               kind: str = "task", enabled_plugins: list[str] | None = None) -> bool:
     """Launch the Claude session in tmux. Messaging goes through session-bridge."""
     session = tmux_session_name(task_id)
+    # Default cwd is the task dir, which is also the sandbox $HOME — keeping
+    # cwd == $HOME stops Claude's project-config walk from escaping the
+    # sandbox. An explicit cwd (a real project) opts out of that guarantee:
+    # the walk will climb to the real ~/.claude above that project.
     td = cwd or str(task_dir(task_id))
 
     # Per-task hooks (Stop, Notification) → ~/.taskpilot/<id>/state/agent.json
     hook_settings = write_hook_settings(task_id)
 
     # Build a curated $HOME so the agent doesn't inherit the user's daily-driver
-    # ~/.claude environment (global CLAUDE.md, rules, every installed plugin's
-    # skills, every registered MCP). Without this, beats-dj loaded ~30k+ tokens
-    # of irrelevant context (phone bridge instructions, contact list, etc.) at
-    # every restart.
-    declared_plugin_keys = []
-    for p in plugins:
-        # `plugins` here is a list of filesystem paths passed to --plugin-dir.
-        # The corresponding installed_plugins.json key isn't derivable from the
-        # path; rely on the symlinked cache making them findable, and trust the
-        # --plugin-dir flag itself for the explicit ones.
-        pass
-    home = prepare_sandbox(task_id, allowed_plugins=declared_plugin_keys)
+    # ~/.claude environment (global CLAUDE.md, rules, personal skills, every
+    # installed plugin's skills, every registered MCP). Without this, beats-dj
+    # loaded ~30k+ tokens of irrelevant context (phone bridge instructions,
+    # contact list, etc.) at every restart.
+    # `plugins` is a list of filesystem paths passed to --plugin-dir (dev-mode
+    # loads). `enabled_plugins` is installed-plugin marketplace keys curated
+    # into the sandbox's enabledPlugins. The two are independent: --plugin-dir
+    # plugins load regardless of enabledPlugins.
+    home = prepare_sandbox(task_id, allowed_plugins=enabled_plugins or [])
 
     # Build plugin-dir flags
     plugin_flags = ""
@@ -668,16 +697,10 @@ cd {td} && claude --dangerously-skip-permissions \\
     # even if the tee can't be installed.
     _setup_pane_log_capture(task_id, session)
 
-    # Auto-accept trust dialog (option 1, "Yes, I trust this folder", is default)
+    # Auto-accept trust dialog (option 1, "Yes, I trust this folder", is default).
+    # The bypass-permissions warning is skipped via the settings.json flag set
+    # in prepare_sandbox, so the next thing claude shows is the channels warning.
     time.sleep(7)
-    subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
-
-    # Auto-accept bypass-permissions warning. With a sandboxed HOME the agent
-    # sees this dialog every spawn. Default selection is "1. No, exit" — naive
-    # Enter would exit. Type "2" then Enter to select "Yes, I accept".
-    time.sleep(3)
-    subprocess.run(["tmux", "send-keys", "-t", session, "2"])
-    time.sleep(0.3)
     subprocess.run(["tmux", "send-keys", "-t", session, "Enter"])
 
     # Auto-accept channels warning (default option is fine here)

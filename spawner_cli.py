@@ -23,6 +23,7 @@ def main():
     parser.add_argument("description", help="Task description")
     parser.add_argument("--name", help="Explicit task name (default: derived from description)")
     parser.add_argument("--plugins", help="Comma-separated plugin directory paths", default="")
+    parser.add_argument("--enabled-plugins", help="Comma-separated installed-plugin marketplace keys to enable in the sandbox", default="")
     parser.add_argument("--brief", help="Path to JSON file with operating brief", default="")
     parser.add_argument("--cwd", help="Working directory for the task", default="")
     parser.add_argument("--channels", help="Comma-separated additional dev channel servers", default="")
@@ -34,6 +35,7 @@ def main():
         name = args.name or args.description[:80]
         task_id = spawner.slugify(name)
         plugins = [p.strip() for p in args.plugins.split(",") if p.strip()]
+        enabled_plugins = [p.strip() for p in args.enabled_plugins.split(",") if p.strip()]
 
         # Load operating brief from file if provided
         operating_brief = {}
@@ -68,7 +70,7 @@ def main():
 
         # Create task
         task = store.create_task(conn, task_id, name, args.description, plugins, operating_brief,
-                                 cwd=cwd, channels=channels)
+                                 cwd=cwd, channels=channels, enabled_plugins=enabled_plugins)
         conn.close()
 
         # Write config files
@@ -86,6 +88,7 @@ def main():
         success = spawner.spawn_tmux(
             task_id, plugins, model=args.model or None,
             cwd=cwd, channels=channels, kind="task",
+            enabled_plugins=enabled_plugins,
         )
         if not success:
             print(json.dumps({"ok": False, "error": "Failed to launch tmux session"}))

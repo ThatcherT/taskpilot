@@ -94,6 +94,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN last_error TEXT DEFAULT NULL")
         conn.commit()
 
+    # Migrate: enabled_plugins — marketplace plugin keys to enable in the
+    # task's sandbox (separate from `plugins`, which is dev-mode --plugin-dir
+    # paths). Empty list = only the forced session-bridge/taskpilot defaults.
+    try:
+        conn.execute("SELECT enabled_plugins FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN enabled_plugins TEXT DEFAULT '[]'")
+        conn.commit()
+
 
 def allocate_port(conn: sqlite3.Connection) -> int:
     """Find the next available port starting from PORT_RANGE_START."""
@@ -116,14 +125,16 @@ def create_task(
     channels: list[str] | None = None,
     kind: str = "task",
     host: str | None = None,
+    enabled_plugins: list[str] | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind, host)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind, host, enabled_plugins)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
          json.dumps(plugins or []), json.dumps(operating_brief or {}), model,
-         cwd, json.dumps(channels or []), kind, host),
+         cwd, json.dumps(channels or []), kind, host,
+         json.dumps(enabled_plugins or [])),
     )
     conn.commit()
     return get_task(conn, task_id)

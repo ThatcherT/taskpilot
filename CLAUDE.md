@@ -86,6 +86,18 @@ All three share `hooks/_record.py` for the read-modify-write of `agent.json` and
 - Project-scoped MCPs from the task's `cwd/.claude/settings.json` are registered into `~/.claude.json` at launch (and cleaned up on kill via `project_mcps.json`).
 - Trust dialog + channels warning auto-accepted via `tmux send-keys Enter`.
 
+## Sandboxed $HOME
+
+Each spawned agent runs with `HOME=~/.taskpilot/<task_id>/home/` instead of inheriting the user's daily-driver `~/.claude` environment (global CLAUDE.md, rules, every installed plugin's skills, every registered MCP). `prepare_sandbox` in `spawner.py` builds this curated $HOME:
+
+- `~/.claude/plugins/` — symlinked to the user's real dir, so the loader can find every plugin and its marketplace metadata. Curation happens via `enabledPlugins`, not by hiding files.
+- `~/.claude/settings.json` — sandbox-local. Lists `enabledPlugins` (only the curated set), carries forward `pluginConfigs` for each enabled plugin (so `CLAUDE_PLUGIN_OPTION_*` env vars inject), and `extraKnownMarketplaces`. Sensitive userConfig values live in the OS keychain and resolve automatically — the agent runs as the same OS user.
+- `~/.claude/sessions/` + `~/.claude/.credentials.json` — symlinked to the user's (session-bridge scans the real sessions dir; credentials avoid a re-login).
+- `~/.claude.json` — copied from the user's minus `mcpServers` and `projects`, so account/onboarding state carries forward but global MCPs and per-project history don't.
+- `~/.claude/projects/` — sandbox-local; transcripts isolate per agent.
+
+Which plugins load is set by `create_task(enabled_plugins=[...])` — a list of marketplace keys (e.g. `liteframe@softwaresoftware-plugins`). `session-bridge` and `taskpilot` are always enabled (channel + lifecycle hooks); everything else stays installed but inert unless listed. This is what lets a caller (llm-dispatcher, plugin-tester) request a specific plugin set per task. Note `enabled_plugins` is distinct from `plugins`, which is dev-mode `--plugin-dir` filesystem paths and loads regardless of `enabledPlugins`.
+
 ## Data
 
 - Database: `~/.taskpilot/taskpilot.db` (SQLite with WAL mode)
@@ -108,7 +120,7 @@ claude --plugin-dir /home/thatcher/projects/softwaresoftware/projects/plugins/pr
 
 ## MCP Tools
 
-- `create_task(name, description, plugins?, operating_brief?, model?, kind?, host?)` — create task config + allocate port. kind="service" for reboot-persistent agents. host="<peer>" to launch the agent on a remote mesh host (forwards spawn to that peer's session-bridge `/spawn`).
+- `create_task(name, description, plugins?, operating_brief?, model?, kind?, host?, enabled_plugins?)` — create task config + allocate port. kind="service" for reboot-persistent agents. host="<peer>" to launch the agent on a remote mesh host (forwards spawn to that peer's session-bridge `/spawn`). `enabled_plugins` is a list of installed-plugin marketplace keys to enable in the task's sandbox (see "Sandboxed $HOME" below); `plugins` is the separate dev-mode `--plugin-dir` path list.
 - `spawn_task(task_id)` — launch tmux session (~16s startup). When the task carries `host` and that host is not self, forwards to the peer's `POST /spawn` instead.
 - `list_tasks(status?)` — list all tasks with live health
 - `get_task(task_id)` — full detail + state.json

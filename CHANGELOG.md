@@ -2,6 +2,18 @@
 
 All notable changes to taskpilot.
 
+## 0.9.0 — 2026-05-15
+
+### Added
+
+- **Sandboxed `$HOME` for spawned agents.** Each agent runs with `HOME` set to its own task directory instead of inheriting the user's daily-driver `~/.claude` environment. `prepare_sandbox` builds a curated home: the user's `plugins/`, `sessions/`, and `.credentials.json` are symlinked in; `settings.json` is sandbox-local with a curated `enabledPlugins`; `.claude.json` carries account/onboarding state minus the user's global `mcpServers` and `projects`. This cut the context floor for a minimal agent from ~47k to ~33k tokens.
+- **Per-task plugin curation via `enabled_plugins`.** `create_task` accepts a new `enabled_plugins` list of installed-plugin marketplace keys (e.g. `liteframe@softwaresoftware-plugins`) to enable in the task's sandbox. `session-bridge` and `taskpilot` are always enabled; everything else stays installed but inert, so its skills and tools never load into the agent's context. Lets a caller request a specific plugin set per task. CLI: `--enabled-plugins`.
+- **`pluginConfigs` carry-forward.** The sandbox `settings.json` now carries forward each enabled plugin's `pluginConfigs` entry (and `extraKnownMarketplaces`) from the user's real settings, so an enabled plugin's `CLAUDE_PLUGIN_OPTION_*` env vars still inject. Previously any plugin beyond the two defaults would have come up unconfigured.
+
+### Fixed
+
+- **Personal skills no longer leak into the sandbox.** Claude Code discovers project `.claude/` config (skills, rules, `CLAUDE.md`) by walking up the directory tree from cwd, stopping at `$HOME`. The sandbox previously ran the agent with cwd at the *parent* of `$HOME`, so the walk escaped to the real `/home/<user>/.claude/` and pulled in personal skills. `sandbox_home` is now the task directory itself, so `HOME == cwd` and the walk terminates inside the sandbox.
+
 ## 0.8.0 — 2026-05-06
 
 ### Added

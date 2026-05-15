@@ -65,13 +65,15 @@ def create_task(
     channels: list[str] | None = None,
     kind: str = "task",
     host: str | None = None,
+    enabled_plugins: list[str] | None = None,
 ) -> dict:
     """Create a new autonomous task. Writes config files and allocates a channel port.
 
     Args:
         name: Human-readable task name (e.g., "Sell my lawnmower").
         description: Full task description — what the agent should do.
-        plugins: Optional list of plugin directory paths to load.
+        plugins: Optional list of plugin directory paths to load (dev-mode
+            --plugin-dir flags). For installed plugins, use enabled_plugins.
         operating_brief: Optional dict with richer task definition. Keys:
             objectives (list[str]): Measurable goals.
             workflows (list[str]): Ordered phases/steps.
@@ -87,6 +89,11 @@ def create_task(
             and not the local host, spawn_task forwards the launch to that
             peer's session-bridge daemon. None or self-host = local launch.
             kind="service" is not yet supported for remote hosts.
+        enabled_plugins: Optional list of installed-plugin marketplace keys
+            (e.g. ["liteframe@softwaresoftware-plugins"]) to enable in the
+            task's sandbox $HOME. session-bridge and taskpilot are always
+            enabled regardless. Anything not listed stays installed but inert,
+            so its skills/tools don't load into the agent's context.
 
     Returns:
         Task record with task_id, port, and status.
@@ -101,6 +108,7 @@ def create_task(
     plugins = plugins or []
     operating_brief = operating_brief or {}
     channels = channels or []
+    enabled_plugins = enabled_plugins or []
 
     # Auto-resolve capability plugins via nov-dependency-resolver
     capabilities = operating_brief.get("capabilities", [])
@@ -118,7 +126,7 @@ def create_task(
         conn.close()
         return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
 
-    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels, kind=kind, host=host)
+    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels, kind=kind, host=host, enabled_plugins=enabled_plugins)
     conn.close()
 
     # Write config files
@@ -155,6 +163,7 @@ def spawn_task(task_id: str) -> dict:
     channels = json.loads(task["channels"]) if task.get("channels") else []
     kind = task.get("kind", "task")
     host = task.get("host")
+    enabled_plugins = json.loads(task["enabled_plugins"]) if task.get("enabled_plugins") else []
 
     # Remote host? Forward to that host's session-bridge /spawn. The peer's
     # daemon does the tmux + claude work and waits for registration.
@@ -191,7 +200,7 @@ def spawn_task(task_id: str) -> dict:
     # tradeoff every fallback makes.
     conn = store.get_db()
     try:
-        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind)
+        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind, enabled_plugins=enabled_plugins)
     except spawner.ChannelResolutionError as e:
         conn.close()
         return {"error": f"channel validation failed: {e}"}
