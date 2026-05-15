@@ -30,7 +30,7 @@ Spawn and manage long-running autonomous Claude Code sessions. Each task runs in
 
 ## Supervisor Daemon
 
-`daemon.py` runs as a systemd user unit (`taskpilot-daemon.service`) on port `:8912`. It exposes:
+`daemon.py` runs as a boot-persistence service on port `:8912` — a systemd user unit (`taskpilot-daemon.service`) on Linux, a launchd agent (`com.softwaresoftware.taskpilot-daemon`) on macOS. It exposes:
 
 - `GET /health` — daemon status + supervised task count
 - `GET /tasks` — list with live tmux/channel health
@@ -47,10 +47,10 @@ Both `kind=task` and `kind=service` use the same spawn path. The kind difference
 
 The MCP server (`server.py`) is a thin client — `_daemon_call()` POSTs to the daemon, falling back to in-process spawn when the daemon is unreachable so the tool works in tests and pre-daemon installs.
 
-Install or update the systemd unit:
+Install or update the boot-persistence service (systemd on Linux, launchd on macOS — auto-detected):
 
 ```bash
-python3 daemon.py --install      # writes ~/.config/systemd/user/taskpilot-daemon.service, enables, starts
+python3 daemon.py --install      # Linux: writes ~/.config/systemd/user/taskpilot-daemon.service. macOS: writes ~/Library/LaunchAgents/com.softwaresoftware.taskpilot-daemon.plist. Then enables + starts.
 python3 daemon.py --uninstall    # stop, disable, remove
 journalctl --user -u taskpilot-daemon -f
 ```

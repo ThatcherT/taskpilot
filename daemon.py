@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import subprocess
 import sys
 from contextlib import asynccontextmanager
@@ -381,11 +382,14 @@ def message(task_id: str, body: MessageRequest) -> dict:
 # --- Entry point ---
 
 
-# --- Systemd user unit installation ---
+# --- Boot-persistence service installation (systemd on Linux, launchd on macOS) ---
 
 
 SYSTEMD_UNIT_NAME = "taskpilot-daemon.service"
 SYSTEMD_UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME
+
+LAUNCHD_LABEL = "com.softwaresoftware.taskpilot-daemon"
+LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 
 def _systemd_unit_text() -> str:
@@ -443,15 +447,101 @@ def uninstall_systemd_unit() -> None:
     print(f"uninstalled {SYSTEMD_UNIT_NAME}")
 
 
+def _launchd_plist_text() -> str:
+    """Render the taskpilot-daemon launchd agent plist (macOS).
+
+    AbandonProcessGroup mirrors the systemd unit's `KillMode=process`: the
+    daemon spawns detached tmux sessions per task, and launchd must not tear
+    those down when it stops/restarts the daemon. KeepAlive.SuccessfulExit=false
+    mirrors `Restart=on-failure` — restart on crash, not on a clean exit.
+    """
+    py = subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip() or "/usr/bin/python3"
+    daemon_py = str(Path(__file__).resolve())
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{py}</string>
+        <string>{daemon_py}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/taskpilot-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/taskpilot-daemon.log</string>
+</dict>
+</plist>
+"""
+
+
+def install_launchd_agent() -> None:
+    """Write the plist, (re)load it. Idempotent."""
+    LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAUNCHD_PLIST_PATH.write_text(_launchd_plist_text())
+    print(f"wrote {LAUNCHD_PLIST_PATH}")
+    # Unload first so a changed plist actually takes effect; ignore "not loaded".
+    subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST_PATH)], check=False,
+                    capture_output=True)
+    subprocess.run(["launchctl", "load", "-w", str(LAUNCHD_PLIST_PATH)], check=True)
+    print(f"loaded {LAUNCHD_LABEL}")
+
+
+def uninstall_launchd_agent() -> None:
+    """Unload and remove the plist. Idempotent."""
+    subprocess.run(["launchctl", "unload", "-w", str(LAUNCHD_PLIST_PATH)], check=False,
+                    capture_output=True)
+    if LAUNCHD_PLIST_PATH.exists():
+        LAUNCHD_PLIST_PATH.unlink()
+        print(f"removed {LAUNCHD_PLIST_PATH}")
+    print(f"uninstalled {LAUNCHD_LABEL}")
+
+
+def install_daemon_service() -> None:
+    """Install the boot-persistence service for the current OS."""
+    osname = platform.system()
+    if osname == "Linux":
+        install_systemd_unit()
+    elif osname == "Darwin":
+        install_launchd_agent()
+    else:
+        print(f"taskpilot: no boot-persistence backend for {osname!r} — "
+              "the daemon can still be run directly (python3 daemon.py).",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def uninstall_daemon_service() -> None:
+    """Uninstall the boot-persistence service for the current OS."""
+    osname = platform.system()
+    if osname == "Linux":
+        uninstall_systemd_unit()
+    elif osname == "Darwin":
+        uninstall_launchd_agent()
+    else:
+        print(f"taskpilot: nothing to uninstall on {osname!r}.", file=sys.stderr)
+
+
 # --- Entry point ---
 
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--install":
-        install_systemd_unit()
+        install_daemon_service()
         return
     if len(sys.argv) > 1 and sys.argv[1] == "--uninstall":
-        uninstall_systemd_unit()
+        uninstall_daemon_service()
         return
 
     port = int(os.environ.get("TASKPILOT_DAEMON_PORT", DEFAULT_PORT))
