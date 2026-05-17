@@ -2,6 +2,16 @@
 
 All notable changes to taskpilot.
 
+## 0.10.0 — 2026-05-17
+
+### Added
+
+- **Per-task MCP server injection via `enabled_mcps`.** `create_task` accepts a new `enabled_mcps` list of MCP server names (e.g. `["gmail-organizer", "slack"]`). Each name is resolved against the user's real `~/.claude.json` `mcpServers` and copied verbatim into the task's sandbox. The sandbox otherwise has zero MCP servers — the user's globals never leak in — so a task gets exactly the servers its caller declares. Names with no match are skipped. CLI: `--enabled-mcps`. This completes the v0.9.0 sandbox story: a caller now fully defines the agent's environment (plugins via `enabled_plugins`, MCP servers via `enabled_mcps`).
+
+### Changed
+
+- `prepare_sandbox` takes `enabled_mcps: list[str]` (server names, resolved internally) in place of the unused `declared_mcps: dict` parameter.
+
 ## 0.9.0 — 2026-05-15
 
 ### Added

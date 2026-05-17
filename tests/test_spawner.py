@@ -243,7 +243,11 @@ class TestPrepareSandbox:
         (claude / "settings.json").write_text(json.dumps(settings))
         (user_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"id": "u1"},
-            "mcpServers": {"global-mcp": {}},
+            "mcpServers": {
+                "gmail-organizer": {"command": "node", "args": ["gmail.js"]},
+                "slack": {"command": "node", "args": ["slack.js"]},
+                "global-mcp": {"command": "x"},
+            },
             "projects": {"/some/proj": {}},
         }))
 
@@ -297,9 +301,30 @@ class TestPrepareSandbox:
         }
 
     def test_claude_json_strips_mcps_and_projects(self, fake_home):
-        """The sandbox .claude.json keeps account state but not global MCPs/projects."""
+        """The sandbox .claude.json keeps account state but not global MCPs/projects.
+
+        With no enabled_mcps, the sandbox has zero MCP servers — the user's
+        globals do not leak in.
+        """
         spawner.prepare_sandbox("t6", allowed_plugins=[])
         cj = json.loads((spawner.sandbox_home("t6") / ".claude.json").read_text())
         assert cj["oauthAccount"] == {"id": "u1"}
         assert cj["mcpServers"] == {}
         assert "projects" not in cj or cj["projects"] == {}
+
+    def test_enabled_mcps_injected(self, fake_home):
+        """Named MCP servers are resolved from the user's ~/.claude.json and copied in."""
+        spawner.prepare_sandbox("t7", allowed_plugins=[], enabled_mcps=["gmail-organizer", "slack"])
+        cj = json.loads((spawner.sandbox_home("t7") / ".claude.json").read_text())
+        assert cj["mcpServers"] == {
+            "gmail-organizer": {"command": "node", "args": ["gmail.js"]},
+            "slack": {"command": "node", "args": ["slack.js"]},
+        }
+        # not requested → not present
+        assert "global-mcp" not in cj["mcpServers"]
+
+    def test_enabled_mcps_unmatched_skipped(self, fake_home):
+        """An MCP name with no entry in the user's ~/.claude.json is skipped, not an error."""
+        spawner.prepare_sandbox("t8", allowed_plugins=[], enabled_mcps=["gmail-organizer", "nonexistent"])
+        cj = json.loads((spawner.sandbox_home("t8") / ".claude.json").read_text())
+        assert list(cj["mcpServers"].keys()) == ["gmail-organizer"]

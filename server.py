@@ -66,6 +66,7 @@ def create_task(
     kind: str = "task",
     host: str | None = None,
     enabled_plugins: list[str] | None = None,
+    enabled_mcps: list[str] | None = None,
 ) -> dict:
     """Create a new autonomous task. Writes config files and allocates a channel port.
 
@@ -94,6 +95,10 @@ def create_task(
             task's sandbox $HOME. session-bridge and taskpilot are always
             enabled regardless. Anything not listed stays installed but inert,
             so its skills/tools don't load into the agent's context.
+        enabled_mcps: Optional list of MCP server names (e.g. ["gmail-organizer",
+            "slack"]) the task needs. Each is resolved against the user's real
+            ~/.claude.json and copied into the task's sandbox. The sandbox
+            otherwise has no MCP servers — the user's globals don't leak in.
 
     Returns:
         Task record with task_id, port, and status.
@@ -109,6 +114,7 @@ def create_task(
     operating_brief = operating_brief or {}
     channels = channels or []
     enabled_plugins = enabled_plugins or []
+    enabled_mcps = enabled_mcps or []
 
     # Auto-resolve capability plugins via nov-dependency-resolver
     capabilities = operating_brief.get("capabilities", [])
@@ -126,7 +132,7 @@ def create_task(
         conn.close()
         return {"error": f"Task '{task_id}' already exists with status '{existing['status']}'"}
 
-    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels, kind=kind, host=host, enabled_plugins=enabled_plugins)
+    task = store.create_task(conn, task_id, name, description, plugins, operating_brief, model, cwd, channels, kind=kind, host=host, enabled_plugins=enabled_plugins, enabled_mcps=enabled_mcps)
     conn.close()
 
     # Write config files
@@ -164,6 +170,7 @@ def spawn_task(task_id: str) -> dict:
     kind = task.get("kind", "task")
     host = task.get("host")
     enabled_plugins = json.loads(task["enabled_plugins"]) if task.get("enabled_plugins") else []
+    enabled_mcps = json.loads(task["enabled_mcps"]) if task.get("enabled_mcps") else []
 
     # Remote host? Forward to that host's session-bridge /spawn. The peer's
     # daemon does the tmux + claude work and waits for registration.
@@ -200,7 +207,7 @@ def spawn_task(task_id: str) -> dict:
     # tradeoff every fallback makes.
     conn = store.get_db()
     try:
-        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind, enabled_plugins=enabled_plugins)
+        success = spawner.spawn_tmux(task_id, plugins, model=model, cwd=cwd, channels=channels, kind=kind, enabled_plugins=enabled_plugins, enabled_mcps=enabled_mcps)
     except spawner.ChannelResolutionError as e:
         conn.close()
         return {"error": f"channel validation failed: {e}"}

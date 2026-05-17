@@ -103,6 +103,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN enabled_plugins TEXT DEFAULT '[]'")
         conn.commit()
 
+    # Migrate: enabled_mcps — names of MCP servers to inject into the task's
+    # sandbox .claude.json, resolved from the user's real ~/.claude.json.
+    # Empty list = no MCP servers (the sandbox strips the user's global ones).
+    try:
+        conn.execute("SELECT enabled_mcps FROM tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE tasks ADD COLUMN enabled_mcps TEXT DEFAULT '[]'")
+        conn.commit()
+
 
 def allocate_port(conn: sqlite3.Connection) -> int:
     """Find the next available port starting from PORT_RANGE_START."""
@@ -126,15 +135,16 @@ def create_task(
     kind: str = "task",
     host: str | None = None,
     enabled_plugins: list[str] | None = None,
+    enabled_mcps: list[str] | None = None,
 ) -> dict:
     port = allocate_port(conn)
     conn.execute(
-        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind, host, enabled_plugins)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO tasks (task_id, name, description, port, plugins, operating_brief, model, cwd, channels, kind, host, enabled_plugins, enabled_mcps)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (task_id, name, description, port,
          json.dumps(plugins or []), json.dumps(operating_brief or {}), model,
          cwd, json.dumps(channels or []), kind, host,
-         json.dumps(enabled_plugins or [])),
+         json.dumps(enabled_plugins or []), json.dumps(enabled_mcps or [])),
     )
     conn.commit()
     return get_task(conn, task_id)

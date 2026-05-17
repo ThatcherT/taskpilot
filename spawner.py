@@ -456,7 +456,7 @@ def sandbox_home(task_id: str) -> Path:
 
 
 def prepare_sandbox(task_id: str, allowed_plugins: list[str] | None = None,
-                    declared_mcps: dict | None = None) -> Path:
+                    enabled_mcps: list[str] | None = None) -> Path:
     """Build a curated $HOME for the agent so it doesn't inherit the user's
     daily-driver Claude environment (CLAUDE.md, rules, MCPs, plugin list).
 
@@ -474,12 +474,17 @@ def prepare_sandbox(task_id: str, allowed_plugins: list[str] | None = None,
           settings.json           (curated enabledPlugins + carried-forward
                                    pluginConfigs for the enabled plugins)
           .credentials.json       -> symlink to user's (no re-login)
-        .claude.json              (account state minus mcpServers + projects)
+        .claude.json              (account state; mcpServers = only the
+                                   `enabled_mcps` resolved from the user's)
         CLAUDE.md                 (task context, written by write_task_config)
 
     No CLAUDE.md/rules/ from the user's real $HOME are provisioned; the agent's
     task-specific context comes from the CLAUDE.md write_task_config drops at
     task_dir. Re-runs are idempotent: existing files/symlinks get rebuilt.
+
+    `enabled_mcps` is a list of MCP server names; each is resolved against the
+    user's real ~/.claude.json `mcpServers` and copied into the sandbox's. The
+    user's other MCP servers do not leak in — the sandbox starts with none.
     """
     home = sandbox_home(task_id)
     claude_dir = home / ".claude"
@@ -572,7 +577,17 @@ def prepare_sandbox(task_id: str, allowed_plugins: list[str] | None = None,
     real_user = _read_json(CLAUDE_JSON) or {}
     blocked = {"mcpServers", "projects"}
     claude_json_payload = {k: v for k, v in real_user.items() if k not in blocked}
-    claude_json_payload["mcpServers"] = dict(declared_mcps or {})
+
+    # MCP servers — the sandbox starts with none of the user's. A caller
+    # declares the servers a task needs via `enabled_mcps` (names); each is
+    # resolved against the user's real ~/.claude.json and its config copied
+    # in verbatim. The MCP runs as the agent's subprocess under the same OS
+    # user, so any paths/secrets in the config still resolve. Names with no
+    # match are skipped (symmetric with how enabledPlugins filters).
+    real_mcps = real_user.get("mcpServers") or {}
+    claude_json_payload["mcpServers"] = {
+        name: real_mcps[name] for name in (enabled_mcps or []) if name in real_mcps
+    }
     (home / ".claude.json").write_text(json.dumps(claude_json_payload, indent=2))
 
     return home
@@ -608,7 +623,8 @@ def write_hook_settings(task_id: str) -> Path:
 
 def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
                cwd: str | None = None, channels: list[str] | None = None,
-               kind: str = "task", enabled_plugins: list[str] | None = None) -> bool:
+               kind: str = "task", enabled_plugins: list[str] | None = None,
+               enabled_mcps: list[str] | None = None) -> bool:
     """Launch the Claude session in tmux. Messaging goes through session-bridge."""
     session = tmux_session_name(task_id)
     # Default cwd is the task dir, which is also the sandbox $HOME — keeping
@@ -628,8 +644,10 @@ def spawn_tmux(task_id: str, plugins: list[str], model: str | None = None,
     # `plugins` is a list of filesystem paths passed to --plugin-dir (dev-mode
     # loads). `enabled_plugins` is installed-plugin marketplace keys curated
     # into the sandbox's enabledPlugins. The two are independent: --plugin-dir
-    # plugins load regardless of enabledPlugins.
-    home = prepare_sandbox(task_id, allowed_plugins=enabled_plugins or [])
+    # plugins load regardless of enabledPlugins. `enabled_mcps` names MCP
+    # servers to copy from the user's ~/.claude.json into the sandbox's.
+    home = prepare_sandbox(task_id, allowed_plugins=enabled_plugins or [],
+                           enabled_mcps=enabled_mcps or [])
 
     # Build plugin-dir flags
     plugin_flags = ""
